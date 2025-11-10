@@ -4203,6 +4203,74 @@ function luna_generate_openai_answer($pid, $prompt, $facts, $is_comprehensive_re
  * REST: Chat + History + Hub-facing lists + Utilities
  * ============================================================ */
 
+if (!function_exists('luna_request_value_signals_composer')) {
+  function luna_request_value_signals_composer($value) {
+    if (is_bool($value)) {
+      return $value === true;
+    }
+
+    if (is_string($value)) {
+      $normalized = strtolower(trim($value));
+      if ($normalized === '') {
+        return false;
+      }
+
+      $normalized = str_replace(array('\\', '/', '-'), ' ', $normalized);
+
+      if (
+        strpos($normalized, 'composer') !== false ||
+        strpos($normalized, 'luna compose') !== false ||
+        strpos($normalized, 'luna composer') !== false
+      ) {
+        return true;
+      }
+    }
+
+    if (is_array($value)) {
+      foreach ($value as $item) {
+        if (luna_request_value_signals_composer($item)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+}
+
+if (!function_exists('luna_request_has_composer_signal')) {
+  function luna_request_has_composer_signal(WP_REST_Request $req) {
+    $params = $req->get_params();
+    foreach ($params as $key => $value) {
+      if ($key === 'prompt' || $key === 'message') {
+        continue;
+      }
+
+      if (is_string($key) && luna_request_value_signals_composer($key)) {
+        return true;
+      }
+
+      if (luna_request_value_signals_composer($value)) {
+        return true;
+      }
+    }
+
+    if (!empty($_SERVER['HTTP_X_LUNA_COMPOSER'])) {
+      if (luna_request_value_signals_composer($_SERVER['HTTP_X_LUNA_COMPOSER'])) {
+        return true;
+      }
+    }
+
+    if (!empty($_SERVER['HTTP_REFERER'])) {
+      if (luna_request_value_signals_composer($_SERVER['HTTP_REFERER'])) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+}
+
 function luna_widget_chat_handler( WP_REST_Request $req ) {
   $prompt = trim( (string) $req->get_param('prompt') );
   $is_greeting = (bool) $req->get_param('greeting');
