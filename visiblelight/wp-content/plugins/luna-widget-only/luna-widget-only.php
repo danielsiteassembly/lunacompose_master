@@ -4418,6 +4418,12 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   $meta   = array('source' => 'deterministic');
   if ($is_composer) {
     $meta['composer'] = true;
+    if (is_array($matched_composer_prompt) && !empty($matched_composer_prompt['id'])) {
+      $meta['composer_prompt_id'] = (int) $matched_composer_prompt['id'];
+    }
+    if (is_array($matched_composer_prompt) && !empty($matched_composer_prompt['source'])) {
+      $meta['composer_prompt_source'] = $matched_composer_prompt['source'];
+    }
   }
   
   // Check if this is a comprehensive report request (multi-sentence, paragraph format, etc.)
