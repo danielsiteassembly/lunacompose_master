@@ -4238,58 +4238,6 @@ if (!function_exists('luna_request_value_signals_composer')) {
   }
 }
 
-if (!function_exists('luna_prompt_signals_composer')) {
-  function luna_prompt_signals_composer($prompt) {
-    if (!is_string($prompt)) {
-      return false;
-    }
-
-    $prompt = trim($prompt);
-    if ($prompt === '') {
-      return false;
-    }
-
-    $lc = function_exists('mb_strtolower') ? mb_strtolower($prompt) : strtolower($prompt);
-
-    // Long-form content typically has higher word and character counts or multiple paragraphs
-    if (str_word_count($prompt) >= 80 || strlen($prompt) >= 500 || substr_count($prompt, "\n") >= 2) {
-      return true;
-    }
-
-    $longform_patterns = array(
-      '/\\b(write|draft|compose|generate|craft|create|build)\\b.*\\b(report|blog|article|essay|post|summary|analysis|brief|playbook|plan|guide)\\b/i',
-      '/\\b500\\s*(word|words)\\b/i',
-      '/\\b(year over year|yoy)\\b.*\\b(growth|metrics|analysis)\\b/i',
-      '/\\bshare of voice\\b/i',
-      '/\\btop content\\b/i',
-      '/\\bengagement metrics\\b/i',
-      '/\\bexecutive\\b.*\\bsummary\\b/i',
-      '/\\bintelligent\\s+suggestions\\b/i',
-      '/\\bactionable\\b.*\\b(recommendation|insight)s?\\b/i',
-      '/\\broadmap\\b.*\\b(next steps|recommendations)\\b/i'
-    );
-
-    foreach ($longform_patterns as $pattern) {
-      if (preg_match($pattern, $prompt)) {
-        return true;
-      }
-    }
-
-    $complexity_signals = 0;
-    if (substr_count($lc, ' and ') >= 2) {
-      $complexity_signals++;
-    }
-    if (substr_count($prompt, ',') >= 4) {
-      $complexity_signals++;
-    }
-    if (substr_count($prompt, '?') >= 2) {
-      $complexity_signals++;
-    }
-
-    return $complexity_signals >= 2;
-  }
-}
-
 if (!function_exists('luna_request_has_composer_signal')) {
   function luna_request_has_composer_signal(WP_REST_Request $req) {
     $params = $req->get_params();
@@ -4408,41 +4356,16 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   $composer_flag_param = $req->get_param('composer');
   if ($composer_flag_param === true || $composer_flag_param === '1' || $composer_flag_param === 1) {
     $is_composer = true;
-  } elseif (is_string($composer_flag_param)) {
-    $flag_normalized = strtolower(trim($composer_flag_param));
-    if (in_array($flag_normalized, array('true', 'yes', 'on'), true)) {
-      $is_composer = true;
-    } elseif (luna_request_value_signals_composer($flag_normalized)) {
-      $is_composer = true;
-    }
   }
 
   if (!$is_composer) {
     foreach ($composer_markers as $marker) {
-      if ($marker === '') {
-        continue;
-      }
-
       if (in_array($marker, array('composer', 'compose', 'luna_composer', 'luna_compose', 'lunacomposer', 'lunacompose'), true)) {
-        $is_composer = true;
-        break;
-      }
-
-      if (luna_request_value_signals_composer($marker)) {
         $is_composer = true;
         break;
       }
     }
   }
-
-  if (!$is_composer && luna_request_has_composer_signal($req)) {
-    $is_composer = true;
-  }
-
-  if (!$is_composer && luna_prompt_signals_composer($prompt)) {
-    $is_composer = true;
-  }
-
   $composer_enabled = get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1') === '1';
   if ($is_composer && !$composer_enabled) {
     return new WP_REST_Response(array(
@@ -5410,11 +5333,45 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
 
   }
 
+  if ($answer === '' && !$is_composer) {
+    $facts_source = isset($facts['__source']) ? $facts['__source'] : ((isset($facts['comprehensive']) && $facts['comprehensive']) ? 'comprehensive' : 'basic');
+    if ($facts_source !== 'comprehensive') {
+      $canned = luna_widget_find_canned_response($prompt);
+      if (is_array($canned) && !empty($canned['content'])) {
+        $answer = $canned['content'];
+        $meta['source'] = 'canned_response';
+        $meta['canned_id'] = $canned['id'];
+        if (!empty($canned['title'])) {
+          $meta['canned_title'] = $canned['title'];
+        }
+        if (isset($vldr_data['lighthouse_avg'])) {
+          $answer .= "• Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
+        }
+        if (isset($vldr_data['security_grade'])) {
+          $answer .= "• Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+        }
+        if (isset($vldr_data['domain_age_years'])) {
+          $answer .= "• Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
+        }
+        if (isset($vldr_data['uptime_percent'])) {
+          $answer .= "• Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
+        }
+        if (isset($vldr_data['metric_date'])) {
+          $answer .= "\n*Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "*\n";
+        }
+        $answer .= "\n*VL-DR is computed from public indicators: Common Crawl/Index, Bing Web Search, SecurityHeaders.com, WHOIS, Visible Light Uptime monitoring, and Lighthouse performance scores.*";
+      } else {
+        $answer = "I don't have domain ranking data for that domain. Make sure competitor analysis is set up in your Visible Light Hub profile for the domain you're asking about.";
+      }
+    }
+
+  }
+
   // For Luna Composer, ALWAYS use OpenAI to generate long-form, thoughtful, hyper-personal responses
   // Skip deterministic answers for composer requests to ensure all responses are AI-generated
   if ($is_composer && $answer === '') {
     // For Luna Composer, ALWAYS generate long-form, thoughtful, hyper-personal responses
-    $enhanced_prompt = "You are Luna Composer, a sophisticated AI writing assistant that generates long-form, thoughtful, and hyper-personal data-driven content. The user is using Luna Composer to create editable long-form content, so your response must be comprehensive, well-structured, and suitable for professional editing. Write in a thoughtful, engaging, and personable manner that feels human and authentic, not robotic. Use full sentences, proper paragraph breaks, and narrative-style explanations. Include relevant data and insights from the provided facts, but weave them naturally into a cohesive narrative. Make the content feel personalized and tailored to the user's specific needs. Analyze the data, highlight trends, call out risks or opportunities, and provide strategic recommendations or next steps so the user receives meaningful guidance rather than just raw metrics. When data is missing or limited, acknowledge the gap and recommend how to close it. NEVER use emoticons, emojis, unicode symbols, or special characters. Use plain text only. Each time you receive a prompt, craft a fresh perspective so repeated prompts still feel new and insightful. Generate a substantial, detailed response (minimum 300-500 words for simple queries, 800-1200+ words for complex queries) that provides real value and can be edited into polished content.\n\nUser request: " . $prompt;
+    $enhanced_prompt = "You are Luna Composer, a sophisticated AI writing assistant that generates long-form, thoughtful, and hyper-personal data-driven content. The user is using Luna Composer to create editable long-form content, so your response must be comprehensive, well-structured, and suitable for professional editing. Write in a thoughtful, engaging, and personable manner that feels human and authentic, not robotic. Use full sentences, proper paragraph breaks, and narrative-style explanations. Include relevant data and insights from the provided facts, but weave them naturally into a cohesive narrative. Make the content feel personalized and tailored to the user's specific needs. Analyze the data, highlight trends, call out risks or opportunities, and provide strategic recommendations or next steps so the user receives meaningful guidance rather than just raw metrics. When data is missing or limited, acknowledge the gap and recommend how to close it. NEVER use emoticons, emojis, unicode symbols, or special characters. Use plain text only. Generate a substantial, detailed response (minimum 300-500 words for simple queries, 800-1200+ words for complex queries) that provides real value and can be edited into polished content.\n\nUser request: " . $prompt;
     
     // Mark this as a composer request in facts for the OpenAI function
     $facts['__composer'] = true;
