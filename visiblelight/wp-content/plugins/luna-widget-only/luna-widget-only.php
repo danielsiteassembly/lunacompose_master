@@ -4356,35 +4356,15 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   $composer_flag_param = $req->get_param('composer');
   if ($composer_flag_param === true || $composer_flag_param === '1' || $composer_flag_param === 1) {
     $is_composer = true;
-  } elseif (is_string($composer_flag_param)) {
-    $flag_normalized = strtolower(trim($composer_flag_param));
-    if (in_array($flag_normalized, array('true', 'yes', 'on'), true)) {
-      $is_composer = true;
-    } elseif (luna_request_value_signals_composer($flag_normalized)) {
-      $is_composer = true;
-    }
   }
 
   if (!$is_composer) {
     foreach ($composer_markers as $marker) {
-      if ($marker === '') {
-        continue;
-      }
-
       if (in_array($marker, array('composer', 'compose', 'luna_composer', 'luna_compose', 'lunacomposer', 'lunacompose'), true)) {
         $is_composer = true;
         break;
       }
-
-      if (luna_request_value_signals_composer($marker)) {
-        $is_composer = true;
-        break;
-      }
     }
-  }
-
-  if (!$is_composer && luna_request_has_composer_signal($req)) {
-    $is_composer = true;
   }
   $composer_enabled = get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1') === '1';
   if ($is_composer && !$composer_enabled) {
