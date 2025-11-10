@@ -4407,6 +4407,10 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
     }
   }
   
+  if ($is_composer) {
+    $facts['__composer'] = true;
+  }
+
   $site_url = isset($facts['site_url']) ? (string)$facts['site_url'] : home_url('/');
   $security = isset($facts['security']) && is_array($facts['security']) ? $facts['security'] : array();
   $lc    = function_exists('mb_strtolower') ? mb_strtolower($prompt) : strtolower($prompt);
@@ -5340,8 +5344,27 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
         if (!empty($canned['title'])) {
           $meta['canned_title'] = $canned['title'];
         }
+        if (isset($vldr_data['lighthouse_avg'])) {
+          $answer .= "• Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
+        }
+        if (isset($vldr_data['security_grade'])) {
+          $answer .= "• Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+        }
+        if (isset($vldr_data['domain_age_years'])) {
+          $answer .= "• Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
+        }
+        if (isset($vldr_data['uptime_percent'])) {
+          $answer .= "• Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
+        }
+        if (isset($vldr_data['metric_date'])) {
+          $answer .= "\n*Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "*\n";
+        }
+        $answer .= "\n*VL-DR is computed from public indicators: Common Crawl/Index, Bing Web Search, SecurityHeaders.com, WHOIS, Visible Light Uptime monitoring, and Lighthouse performance scores.*";
+      } else {
+        $answer = "I don't have domain ranking data for that domain. Make sure competitor analysis is set up in your Visible Light Hub profile for the domain you're asking about.";
       }
     }
+
   }
 
   // For Luna Composer, ALWAYS use OpenAI to generate long-form, thoughtful, hyper-personal responses
