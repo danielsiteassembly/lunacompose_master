@@ -4203,6 +4203,126 @@ function luna_generate_openai_answer($pid, $prompt, $facts, $is_comprehensive_re
  * REST: Chat + History + Hub-facing lists + Utilities
  * ============================================================ */
 
+if (!function_exists('luna_request_value_signals_composer')) {
+  function luna_request_value_signals_composer($value) {
+    if (is_bool($value)) {
+      return $value === true;
+    }
+
+    if (is_string($value)) {
+      $normalized = strtolower(trim($value));
+      if ($normalized === '') {
+        return false;
+      }
+
+      $normalized = str_replace(array('\\', '/', '-'), ' ', $normalized);
+
+      if (
+        strpos($normalized, 'composer') !== false ||
+        strpos($normalized, 'luna compose') !== false ||
+        strpos($normalized, 'luna composer') !== false
+      ) {
+        return true;
+      }
+    }
+
+    if (is_array($value)) {
+      foreach ($value as $item) {
+        if (luna_request_value_signals_composer($item)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+}
+
+if (!function_exists('luna_prompt_signals_composer')) {
+  function luna_prompt_signals_composer($prompt) {
+    if (!is_string($prompt)) {
+      return false;
+    }
+
+    $prompt = trim($prompt);
+    if ($prompt === '') {
+      return false;
+    }
+
+    $lc = function_exists('mb_strtolower') ? mb_strtolower($prompt) : strtolower($prompt);
+
+    // Long-form content typically has higher word and character counts or multiple paragraphs
+    if (str_word_count($prompt) >= 80 || strlen($prompt) >= 500 || substr_count($prompt, "\n") >= 2) {
+      return true;
+    }
+
+    $longform_patterns = array(
+      '/\\b(write|draft|compose|generate|craft|create|build)\\b.*\\b(report|blog|article|essay|post|summary|analysis|brief|playbook|plan|guide)\\b/i',
+      '/\\b500\\s*(word|words)\\b/i',
+      '/\\b(year over year|yoy)\\b.*\\b(growth|metrics|analysis)\\b/i',
+      '/\\bshare of voice\\b/i',
+      '/\\btop content\\b/i',
+      '/\\bengagement metrics\\b/i',
+      '/\\bexecutive\\b.*\\bsummary\\b/i',
+      '/\\bintelligent\\s+suggestions\\b/i',
+      '/\\bactionable\\b.*\\b(recommendation|insight)s?\\b/i',
+      '/\\broadmap\\b.*\\b(next steps|recommendations)\\b/i'
+    );
+
+    foreach ($longform_patterns as $pattern) {
+      if (preg_match($pattern, $prompt)) {
+        return true;
+      }
+    }
+
+    $complexity_signals = 0;
+    if (substr_count($lc, ' and ') >= 2) {
+      $complexity_signals++;
+    }
+    if (substr_count($prompt, ',') >= 4) {
+      $complexity_signals++;
+    }
+    if (substr_count($prompt, '?') >= 2) {
+      $complexity_signals++;
+    }
+
+    return $complexity_signals >= 2;
+  }
+}
+
+if (!function_exists('luna_request_has_composer_signal')) {
+  function luna_request_has_composer_signal(WP_REST_Request $req) {
+    $params = $req->get_params();
+    foreach ($params as $key => $value) {
+      if ($key === 'prompt' || $key === 'message') {
+        continue;
+      }
+
+      if (is_string($key) && luna_request_value_signals_composer($key)) {
+        return true;
+      }
+
+      if (luna_request_value_signals_composer($value)) {
+        return true;
+      }
+    }
+
+    if (!empty($_SERVER['HTTP_X_LUNA_COMPOSER'])) {
+      if (luna_request_value_signals_composer($_SERVER['HTTP_X_LUNA_COMPOSER'])) {
+        return true;
+      }
+    }
+
+    if (!empty($_SERVER['HTTP_REFERER'])) {
+      if (luna_request_value_signals_composer($_SERVER['HTTP_REFERER'])) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+}
+
 function luna_widget_chat_handler( WP_REST_Request $req ) {
   $prompt = trim( (string) $req->get_param('prompt') );
   $is_greeting = (bool) $req->get_param('greeting');
@@ -4258,9 +4378,71 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   
   // If greeting is part of a larger question, let it proceed to normal processing
 
-  $context = $req->get_param('context');
-  $context = is_string($context) ? sanitize_key($context) : '';
-  $is_composer = ($context === 'composer');
+  $raw_context = $req->get_param('context');
+  $context     = is_string($raw_context) ? sanitize_key($raw_context) : '';
+
+  $is_composer = false;
+  $composer_markers = array();
+
+  if (is_string($raw_context)) {
+    $normalized = strtolower(trim($raw_context));
+    if ($normalized !== '') {
+      $composer_markers[] = $normalized;
+      $composer_markers[] = str_replace(array('/', '\\', '-'), '_', $normalized);
+    }
+  }
+
+  if ($context !== '') {
+    $composer_markers[] = $context;
+  }
+
+  $mode_param = $req->get_param('mode');
+  if (is_string($mode_param)) {
+    $mode_normalized = strtolower(trim($mode_param));
+    if ($mode_normalized !== '') {
+      $composer_markers[] = $mode_normalized;
+      $composer_markers[] = str_replace(array('/', '\\', '-'), '_', $mode_normalized);
+    }
+  }
+
+  $composer_flag_param = $req->get_param('composer');
+  if ($composer_flag_param === true || $composer_flag_param === '1' || $composer_flag_param === 1) {
+    $is_composer = true;
+  } elseif (is_string($composer_flag_param)) {
+    $flag_normalized = strtolower(trim($composer_flag_param));
+    if (in_array($flag_normalized, array('true', 'yes', 'on'), true)) {
+      $is_composer = true;
+    } elseif (luna_request_value_signals_composer($flag_normalized)) {
+      $is_composer = true;
+    }
+  }
+
+  if (!$is_composer) {
+    foreach ($composer_markers as $marker) {
+      if ($marker === '') {
+        continue;
+      }
+
+      if (in_array($marker, array('composer', 'compose', 'luna_composer', 'luna_compose', 'lunacomposer', 'lunacompose'), true)) {
+        $is_composer = true;
+        break;
+      }
+
+      if (luna_request_value_signals_composer($marker)) {
+        $is_composer = true;
+        break;
+      }
+    }
+  }
+
+  if (!$is_composer && luna_request_has_composer_signal($req)) {
+    $is_composer = true;
+  }
+
+  if (!$is_composer && luna_prompt_signals_composer($prompt)) {
+    $is_composer = true;
+  }
+
   $composer_enabled = get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1') === '1';
   if ($is_composer && !$composer_enabled) {
     return new WP_REST_Response(array(
@@ -4302,6 +4484,10 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
     }
   }
   
+  if ($is_composer) {
+    $facts['__composer'] = true;
+  }
+
   $site_url = isset($facts['site_url']) ? (string)$facts['site_url'] : home_url('/');
   $security = isset($facts['security']) && is_array($facts['security']) ? $facts['security'] : array();
   $lc    = function_exists('mb_strtolower') ? mb_strtolower($prompt) : strtolower($prompt);
@@ -4329,918 +4515,906 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
     (strlen($prompt) > 150 && (substr_count($prompt, ',') >= 3 || substr_count($prompt, ' and ') >= 1)) // Long prompt with multiple clauses
   );
 
-  // Deterministic intents using comprehensive Hub data
-  // Enhanced keyword matching for SSL/TLS queries
-  if (preg_match('/\b(tls|ssl|https|certificate|cert|encryption|encrypted|secure.*connection|ssl.*cert|tls.*cert|https.*cert)\b/i', $lc)) {
-    // Check for SSL/TLS data from VL Hub first (most reliable source)
-    $ssl_tls = isset($facts['ssl_tls']) && is_array($facts['ssl_tls']) ? $facts['ssl_tls'] : array();
-    $tls = isset($facts['tls']) && is_array($facts['tls']) ? $facts['tls'] : array();
-    $security_tls = isset($security['tls']) && is_array($security['tls']) ? $security['tls'] : array();
-    
-    // Check if we have SSL/TLS data from VL Hub
-    if (!empty($ssl_tls)) {
-      $certificate = isset($ssl_tls['certificate']) ? $ssl_tls['certificate'] : '';
-      $issuer = isset($ssl_tls['issuer']) ? $ssl_tls['issuer'] : '';
-      $expires = isset($ssl_tls['expires']) ? $ssl_tls['expires'] : '';
-      $days_until_expiry = isset($ssl_tls['days_until_expiry']) ? $ssl_tls['days_until_expiry'] : null;
-      $connected = isset($ssl_tls['connected']) ? (bool)$ssl_tls['connected'] : false;
+  if (!$is_composer) {
+    // Deterministic intents using comprehensive Hub data
+    // Enhanced keyword matching for SSL/TLS queries
+    if (preg_match('/\b(tls|ssl|https|certificate|cert|encryption|encrypted|secure.*connection|ssl.*cert|tls.*cert|https.*cert)\b/i', $lc)) {
+      // Check for SSL/TLS data from VL Hub first (most reliable source)
+      $ssl_tls = isset($facts['ssl_tls']) && is_array($facts['ssl_tls']) ? $facts['ssl_tls'] : array();
+      $tls = isset($facts['tls']) && is_array($facts['tls']) ? $facts['tls'] : array();
+      $security_tls = isset($security['tls']) && is_array($security['tls']) ? $security['tls'] : array();
       
-      if ($connected && !empty($certificate)) {
-        $answer = "**Yes, you have an SSL/TLS certificate configured:**\n\n";
-        $answer .= "**Certificate:** " . $certificate . "\n";
-        if (!empty($issuer)) {
-          $answer .= "**Issuer:** " . $issuer . "\n";
-        }
-        if (!empty($expires)) {
-          $answer .= "**Expires:** " . $expires;
-          if ($days_until_expiry !== null) {
-            $answer .= " (" . intval($days_until_expiry) . " days until expiry)";
+      // Check if we have SSL/TLS data from VL Hub
+      if (!empty($ssl_tls)) {
+        $certificate = isset($ssl_tls['certificate']) ? $ssl_tls['certificate'] : '';
+        $issuer = isset($ssl_tls['issuer']) ? $ssl_tls['issuer'] : '';
+        $expires = isset($ssl_tls['expires']) ? $ssl_tls['expires'] : '';
+        $days_until_expiry = isset($ssl_tls['days_until_expiry']) ? $ssl_tls['days_until_expiry'] : null;
+        $connected = isset($ssl_tls['connected']) ? (bool)$ssl_tls['connected'] : false;
+        
+        if ($connected && !empty($certificate)) {
+          $answer = "**Yes, you have an SSL/TLS certificate configured:**\n\n";
+          $answer .= "**Certificate:** " . $certificate . "\n";
+          if (!empty($issuer)) {
+            $answer .= "**Issuer:** " . $issuer . "\n";
           }
-          $answer .= "\n";
-        }
-        $answer .= "**Status:** Connected\n";
-      }
-    }
-    
-    // Fallback to other TLS data sources
-    $tls_valid = isset($tls['valid']) ? $tls['valid'] : false;
-    $tls_status = isset($security_tls['status']) ? $security_tls['status'] : '';
-    $tls_version = isset($security_tls['version']) ? $security_tls['version'] : '';
-    $tls_issuer = isset($security_tls['issuer']) ? $security_tls['issuer'] : (isset($tls['issuer']) ? $tls['issuer'] : '');
-    $tls_provider = isset($security_tls['provider_guess']) ? $security_tls['provider_guess'] : '';
-    $tls_valid_from = isset($security_tls['valid_from']) ? $security_tls['valid_from'] : '';
-    $tls_valid_to = isset($security_tls['valid_to']) ? $security_tls['valid_to'] : (isset($tls['expires']) ? $tls['expires'] : '');
-    $tls_host = isset($security_tls['host']) ? $security_tls['host'] : '';
-
-    if ($tls_valid || !empty($tls_issuer) || !empty($tls_valid_to)) {
-      $details = array();
-      if ($tls_status) $details[] = "Status: ".$tls_status;
-      if ($tls_version) $details[] = "Version: ".$tls_version;
-      if ($tls_issuer) $details[] = "Issuer: ".$tls_issuer;
-      if ($tls_provider) $details[] = "Provider: ".$tls_provider;
-      if ($tls_valid_from) $details[] = "Valid from: ".$tls_valid_from;
-      if ($tls_valid_to) $details[] = "Valid to: ".$tls_valid_to;
-      if ($tls_host) $details[] = "Host: ".$tls_host;
-
-      $answer = "Yes—TLS/SSL is active for ".$site_url." (".implode(', ', $details).").";
-    } else {
-      $answer = "I don't see SSL/TLS certificate information configured in your Visible Light Hub. Please check the SSL/TLS Status connector in the All Connections tab to ensure your certificate is properly configured.";
-    }
-  }
-  elseif (preg_match('/\bwordpress\b.*\bversion\b|\bwp\b.*\bversion\b/', $lc)) {
-    $v = isset($facts['wp_version']) ? trim((string)$facts['wp_version']) : '';
-    $answer = $v ? ("Your WordPress version is ".$v.".") : "I don't see a confirmed WordPress version in the Hub profile.";
-  }
-  elseif (preg_match('/\btheme\b.*\bactive\b|\bis.*theme.*active\b/', $lc)) {
-    $theme_active = isset($facts['theme_active']) ? (bool)$facts['theme_active'] : true;
-    $theme_name = isset($facts['theme']) ? (string)$facts['theme'] : '';
-    if ($theme_name) {
-      $answer = $theme_active ? ("Yes, the ".$theme_name." theme is currently active.") : ("No, the ".$theme_name." theme is not active.");
-    } else {
-      $answer = "I don't have confirmation on whether the current theme is active.";
-    }
-  }
-  elseif (preg_match('/\bwhat.*theme|\btheme.*name|\bcurrent.*theme\b/', $lc)) {
-    $theme_name = isset($facts['theme']) ? (string)$facts['theme'] : '';
-    $answer = $theme_name ? ("You are using the ".$theme_name." theme.") : "I don't see a confirmed theme in the Hub profile.";
-  }
-  elseif (preg_match('/\bhello\b|\bhi\b|\bhey\b/', $lc)) {
-    $answer = "Hello! I'm Luna, your friendly WebOps assistant. I have access to all your site data from Visible Light Hub. I can help you with WordPress version, themes, plugins, SSL status, and more. What would you like to know?";
-  }
-  elseif (preg_match('/\bup.*to.*date|\boutdated|\bupdate.*available\b/', $lc)) {
-    $updates = isset($facts['updates']) && is_array($facts['updates']) ? $facts['updates'] : array();
-    $core_updates = isset($updates['core']) ? (int)$updates['core'] : 0;
-    $plugin_updates = isset($updates['plugins']) ? (int)$updates['plugins'] : 0;
-    $theme_updates = isset($updates['themes']) ? (int)$updates['themes'] : 0;
-
-    if ($core_updates > 0 || $plugin_updates > 0 || $theme_updates > 0) {
-      $answer = "You have updates available: WordPress Core: ".$core_updates.", Plugins: ".$plugin_updates.", Themes: ".$theme_updates.". I recommend updating for security and performance.";
-    } else {
-      $answer = "Your WordPress installation appears to be up to date. No core, plugin, or theme updates are currently available.";
-    }
-  }
-  elseif (preg_match('/\bthreat.*protection|\bsecurity.*scan|\bmalware.*protection|\bthreat.*detection\b/', $lc)) {
-    $security_ids = isset($security['ids']) && is_array($security['ids']) ? $security['ids'] : array();
-    $ids_provider = isset($security_ids['provider']) ? $security_ids['provider'] : '';
-    $last_scan = isset($security_ids['last_scan']) ? $security_ids['last_scan'] : '';
-    $last_result = isset($security_ids['result']) ? $security_ids['result'] : '';
-    $scan_schedule = isset($security_ids['schedule']) ? $security_ids['schedule'] : '';
-
-    if ($ids_provider) {
-      $details = array();
-      $details[] = "Provider: ".$ids_provider;
-      if ($last_scan) $details[] = "Last scan: ".$last_scan;
-      if ($last_result) $details[] = "Last result: ".$last_result;
-      if ($scan_schedule) $details[] = "Schedule: ".$scan_schedule;
-
-      $answer = "Yes, you have threat protection set up (".implode(', ', $details)."). This helps protect against malware and security threats.";
-    } else {
-      $answer = "I don't see specific threat protection details in your security profile. You may want to consider adding a security plugin like Wordfence or Sucuri for malware protection.";
-    }
-  }
-  elseif (preg_match('/\bfirewall\b/', $lc)) {
-    $security_waf = isset($security['waf']) && is_array($security['waf']) ? $security['waf'] : array();
-    $waf_provider = isset($security_waf['provider']) ? $security_waf['provider'] : '';
-    $last_audit = isset($security_waf['last_audit']) ? $security_waf['last_audit'] : '';
-    if ($waf_provider) {
-      $answer = "Yes, you have a firewall configured. Your WAF provider is ".$waf_provider." with the last audit on ".$last_audit.". This helps block malicious traffic before it reaches your site.";
-    } else {
-      $answer = "I don't see a specific firewall configuration in your security profile. Consider adding a Web Application Firewall (WAF) for additional protection.";
-    }
-  }
-  // Enhanced keyword matching for AWS S3 queries
-  elseif (preg_match('/\b(aws.*s3|s3.*bucket|s3.*storage|amazon.*s3|bucket.*count|object.*count|storage.*used)\b/i', $lc)) {
-    $aws_s3 = isset($facts['aws_s3']) && is_array($facts['aws_s3']) ? $facts['aws_s3'] : array();
-    $connected = isset($aws_s3['connected']) ? (bool)$aws_s3['connected'] : false;
-    $bucket_count = isset($aws_s3['bucket_count']) ? (int)$aws_s3['bucket_count'] : 0;
-    $object_count = isset($aws_s3['object_count']) ? (int)$aws_s3['object_count'] : 0;
-    $storage_used = isset($aws_s3['storage_used']) ? $aws_s3['storage_used'] : 'N/A';
-    $last_sync = isset($aws_s3['last_sync']) ? $aws_s3['last_sync'] : '';
-    
-    if ($connected) {
-      $answer = "**Yes, you have AWS S3 configured!**\n\n";
-      $answer .= "**Connection Status:** Connected\n";
-      if ($bucket_count > 0) {
-        $answer .= "**Buckets:** " . $bucket_count . " bucket(s)\n";
-      }
-      if ($object_count > 0) {
-        $answer .= "**Objects:** " . number_format($object_count) . " objects\n";
-      }
-      if ($storage_used !== 'N/A') {
-        $answer .= "**Storage Used:** " . $storage_used . "\n";
-      }
-      if ($last_sync) {
-        $answer .= "**Last Sync:** " . date('M j, Y g:i A', strtotime($last_sync)) . "\n";
-      }
-      
-      if (!empty($aws_s3['buckets']) && is_array($aws_s3['buckets'])) {
-        $answer .= "\n**Buckets:**\n";
-        foreach (array_slice($aws_s3['buckets'], 0, 10) as $bucket) {
-          $bucket_name = isset($bucket['name']) ? $bucket['name'] : 'Unknown';
-          $bucket_objects = isset($bucket['object_count']) ? (int)$bucket['object_count'] : 0;
-          $bucket_size = isset($bucket['size']) ? $bucket['size'] : '0 B';
-          $answer .= "• " . $bucket_name . " - " . number_format($bucket_objects) . " objects, " . $bucket_size . "\n";
-        }
-        if (count($aws_s3['buckets']) > 10) {
-          $answer .= "... and " . (count($aws_s3['buckets']) - 10) . " more buckets\n";
-        }
-      }
-    } else {
-      $answer = "I don't see AWS S3 configured in your Visible Light Hub. AWS S3 is Amazon's cloud storage service that can be used for backups, media storage, and static asset hosting. You can connect AWS S3 in your Visible Light Hub profile.";
-    }
-  }
-  // Enhanced keyword matching for Liquid Web queries
-  elseif (preg_match('/\b(liquid.*web|liquidweb|hosting.*assets|server.*assets)\b/i', $lc)) {
-    $liquidweb = isset($facts['liquidweb']) && is_array($facts['liquidweb']) ? $facts['liquidweb'] : array();
-    $connected = isset($liquidweb['connected']) ? (bool)$liquidweb['connected'] : false;
-    $assets_count = isset($liquidweb['assets_count']) ? (int)$liquidweb['assets_count'] : 0;
-    $last_sync = isset($liquidweb['last_sync']) ? $liquidweb['last_sync'] : '';
-    
-    if ($connected) {
-      $answer = "**Yes, you have Liquid Web hosting configured!**\n\n";
-      $answer .= "**Connection Status:** Connected\n";
-      if ($assets_count > 0) {
-        $answer .= "**Assets:** " . $assets_count . " asset(s)\n";
-      }
-      if ($last_sync) {
-        $answer .= "**Last Sync:** " . date('M j, Y g:i A', strtotime($last_sync)) . "\n";
-      }
-      
-      if (!empty($liquidweb['assets']) && is_array($liquidweb['assets'])) {
-        $answer .= "\n**Assets:**\n";
-        foreach (array_slice($liquidweb['assets'], 0, 10) as $asset) {
-          $asset_name = isset($asset['name']) ? $asset['name'] : 'Unknown';
-          $asset_type = isset($asset['type']) ? $asset['type'] : 'N/A';
-          $asset_status = isset($asset['status']) ? $asset['status'] : 'unknown';
-          $answer .= "• " . $asset_name . " (" . $asset_type . ") - " . ucfirst($asset_status) . "\n";
-        }
-        if (count($liquidweb['assets']) > 10) {
-          $answer .= "... and " . (count($liquidweb['assets']) - 10) . " more assets\n";
-        }
-      }
-    } else {
-      $answer = "I don't see Liquid Web hosting configured in your Visible Light Hub. Liquid Web is a managed hosting provider. You can connect Liquid Web in your Visible Light Hub profile.";
-    }
-  }
-  elseif (preg_match('/\bcdn\b/', $lc)) {
-    // Check if Cloudflare is connected (which provides CDN)
-    $cloudflare_data = isset($facts['cloudflare']) && is_array($facts['cloudflare']) ? $facts['cloudflare'] : array();
-    $cloudflare_connected = isset($cloudflare_data['connected']) ? (bool)$cloudflare_data['connected'] : false;
-    
-    if ($cloudflare_connected) {
-      $answer = "Yes, you have a CDN configured through Cloudflare! Cloudflare provides a Content Delivery Network (CDN) that serves your content from locations closer to your visitors, improving performance and reducing load times.";
-    } else {
-      $answer = "I don't see a specific CDN configuration in your current profile. A CDN (Content Delivery Network) can improve your site's performance by serving content from locations closer to your visitors. Popular options include Cloudflare, MaxCDN, or KeyCDN.";
-    }
-  }
-  elseif (preg_match('/\bauthentication|\bmfa|\bpassword.*policy|\bsession.*timeout|\bsso\b/', $lc)) {
-    $security_auth = isset($security['auth']) && is_array($security['auth']) ? $security['auth'] : array();
-    $mfa = isset($security_auth['mfa']) ? $security_auth['mfa'] : '';
-    $password_policy = isset($security_auth['password_policy']) ? $security_auth['password_policy'] : '';
-    $session_timeout = isset($security_auth['session_timeout']) ? $security_auth['session_timeout'] : '';
-    $sso_providers = isset($security_auth['sso_providers']) ? $security_auth['sso_providers'] : '';
-
-    $details = array();
-    if ($mfa) $details[] = "MFA: ".$mfa;
-    if ($password_policy) $details[] = "Password Policy: ".$password_policy;
-    if ($session_timeout) $details[] = "Session Timeout: ".$session_timeout;
-    if ($sso_providers) $details[] = "SSO Providers: ".$sso_providers;
-
-    if (!empty($details)) {
-      $answer = "Your authentication settings (".implode(', ', $details).").";
-    } else {
-      $answer = "I don't see specific authentication details in your security profile. Consider setting up MFA, strong password policies, and appropriate session timeouts for better security.";
-    }
-  }
-  elseif (preg_match('/\bdomain.*registrar|\bwho.*registered|\bdomain.*registered.*with\b/', $lc)) {
-    $security_domain = isset($security['domain']) && is_array($security['domain']) ? $security['domain'] : array();
-    $domain_name = isset($security_domain['domain']) ? $security_domain['domain'] : '';
-    $registrar = isset($security_domain['registrar']) ? $security_domain['registrar'] : '';
-    $registered_on = isset($security_domain['registered_on']) ? $security_domain['registered_on'] : '';
-    $renewal_date = isset($security_domain['renewal_date']) ? $security_domain['renewal_date'] : '';
-    $auto_renew = isset($security_domain['auto_renew']) ? $security_domain['auto_renew'] : '';
-    $dns_records = isset($security_domain['dns_records']) ? $security_domain['dns_records'] : '';
-
-    if ($registrar) {
-      $details = array();
-      if ($domain_name) $details[] = "Domain: ".$domain_name;
-      $details[] = "Registrar: ".$registrar;
-      if ($registered_on) $details[] = "Registered: ".$registered_on;
-      if ($renewal_date) $details[] = "Renewal: ".$renewal_date;
-      if ($auto_renew) $details[] = "Auto-renew: ".$auto_renew;
-      if ($dns_records) $details[] = "DNS Records: ".$dns_records;
-
-      $answer = "Your domain information (".implode(', ', $details).").";
-    } else {
-      $answer = "I don't have the domain registrar information in your current profile. You can check this in your domain management panel.";
-    }
-  }
-  elseif (preg_match('/\bblog.*title|\bcreate.*title|\bwrite.*title|\bcontent.*idea\b/', $lc)) {
-    $site_name = isset($facts['site_url']) ? parse_url($facts['site_url'], PHP_URL_HOST) : 'your website';
-    $theme_name = isset($facts['theme']) ? $facts['theme'] : 'your theme';
-    $answer = "Here are some blog title ideas for your new website: 'Welcome to ".$site_name." - A Fresh Digital Experience', 'Introducing Our New ".$theme_name."-Powered Website', 'Behind the Scenes: Building ".$site_name."', or 'What's New at ".$site_name." - A Complete Redesign'. Would you like me to suggest more specific topics?";
-  }
-  elseif (preg_match('/\bwhat.*can.*you.*do|\bwhat.*do.*you.*do|\bhelp.*with\b/', $lc)) {
-    $answer = "I can help you with information about your WordPress site, including themes, plugins, SSL status, pages, posts, users, security settings, domain information, analytics data (page views, users, sessions, bounce rate, engagement), and more. All data comes from your Visible Light Hub profile. What would you like to know?";
-  }
-  elseif (preg_match('/\b(web.*intelligence.*report|intelligence.*report|comprehensive.*report|full.*report|detailed.*report|complete.*analysis)\b/', $lc)) {
-    $answer = luna_generate_web_intelligence_report($facts);
-  }
-  elseif (preg_match('/\b(page.*views|pageviews|analytics|traffic|visitors|users|sessions|bounce.*rate|engagement)\b/', $lc)) {
-    $answer = luna_handle_analytics_request($prompt, $facts);
-  }
-  // Enhanced keyword matching for Cloudflare queries
-  elseif (preg_match('/\b(cloudflare|cdn|ddos|waf|web.*application.*firewall|content.*delivery.*network|cloudflare.*zone|cloudflare.*plan)\b/i', $lc)) {
-    // Check for Cloudflare data from comprehensive profile
-    $cloudflare_data = isset($facts['cloudflare']) && is_array($facts['cloudflare']) ? $facts['cloudflare'] : array();
-    $cloudflare_connected = isset($cloudflare_data['connected']) ? (bool)$cloudflare_data['connected'] : false;
-    
-    if ($cloudflare_connected) {
-      $zones_count = isset($cloudflare_data['zones_count']) ? (int)$cloudflare_data['zones_count'] : 0;
-      $account_id = isset($cloudflare_data['account_id']) ? $cloudflare_data['account_id'] : '';
-      $last_sync = isset($cloudflare_data['last_sync']) ? $cloudflare_data['last_sync'] : null;
-      $zones = isset($cloudflare_data['zones']) && is_array($cloudflare_data['zones']) ? $cloudflare_data['zones'] : array();
-      
-      $answer = "**Yes, you have Cloudflare configured!**\n\n";
-      $answer .= "**Connection Status:** Connected\n";
-      if ($account_id) {
-        $answer .= "**Account ID:** " . $account_id . "\n";
-      }
-      if ($zones_count > 0) {
-        $answer .= "**Zones:** " . $zones_count . " zone(s)\n";
-      }
-      if ($last_sync) {
-        $answer .= "**Last Sync:** " . date('M j, Y g:i A', strtotime($last_sync)) . "\n";
-      }
-      
-      if (!empty($zones)) {
-        $answer .= "\n**Configured Zones:**\n";
-        foreach ($zones as $zone) {
-          $zone_name = isset($zone['name']) ? $zone['name'] : 'Unknown';
-          $zone_status = isset($zone['status']) ? $zone['status'] : 'unknown';
-          $zone_plan = isset($zone['plan']) ? $zone['plan'] : 'Free';
-          $answer .= "• " . $zone_name . " (" . ucfirst($zone_status) . " - " . $zone_plan . " Plan)\n";
-        }
-      }
-      
-      $answer .= "\nCloudflare provides DDoS protection, Web Application Firewall (WAF), CDN caching, and DNS management for enhanced security and performance.";
-    } else {
-      // Check security data streams for Cloudflare
-      $security_streams = isset($facts['security_data_streams']) && is_array($facts['security_data_streams']) ? $facts['security_data_streams'] : array();
-      $cloudflare_streams = array();
-      foreach ($security_streams as $stream_id => $stream_data) {
-        if (strpos($stream_id, 'cloudflare') !== false || (isset($stream_data['name']) && strpos(strtolower($stream_data['name']), 'cloudflare') !== false)) {
-          $cloudflare_streams[$stream_id] = $stream_data;
-        }
-      }
-      
-      if (!empty($cloudflare_streams)) {
-        $answer = "**Cloudflare Data Streams Found:**\n\n";
-        foreach ($cloudflare_streams as $stream_id => $stream_data) {
-          $stream_name = isset($stream_data['name']) ? $stream_data['name'] : 'Cloudflare Zone';
-          $stream_status = isset($stream_data['status']) ? $stream_data['status'] : 'unknown';
-          $health_score = isset($stream_data['health_score']) ? floatval($stream_data['health_score']) : 0;
-          $answer .= "• **" . $stream_name . "**\n";
-          $answer .= "  Status: " . ucfirst($stream_status) . "\n";
-          $answer .= "  Health Score: " . number_format($health_score, 1) . "%\n";
-          if (isset($stream_data['cloudflare_zone_name'])) {
-            $answer .= "  Zone: " . $stream_data['cloudflare_zone_name'] . "\n";
+          if (!empty($expires)) {
+            $answer .= "**Expires:** " . $expires;
+            if ($days_until_expiry !== null) {
+              $answer .= " (" . intval($days_until_expiry) . " days until expiry)";
+            }
+            $answer .= "\n";
           }
-          if (isset($stream_data['cloudflare_plan'])) {
-            $answer .= "  Plan: " . $stream_data['cloudflare_plan'] . "\n";
+          $answer .= "**Status:** Connected\n";
+        }
+      }
+      
+      // Fallback to other TLS data sources
+      $tls_valid = isset($tls['valid']) ? $tls['valid'] : false;
+      $tls_status = isset($security_tls['status']) ? $security_tls['status'] : '';
+      $tls_version = isset($security_tls['version']) ? $security_tls['version'] : '';
+      $tls_issuer = isset($security_tls['issuer']) ? $security_tls['issuer'] : (isset($tls['issuer']) ? $tls['issuer'] : '');
+      $tls_provider = isset($security_tls['provider_guess']) ? $security_tls['provider_guess'] : '';
+      $tls_valid_from = isset($security_tls['valid_from']) ? $security_tls['valid_from'] : '';
+      $tls_valid_to = isset($security_tls['valid_to']) ? $security_tls['valid_to'] : (isset($tls['expires']) ? $tls['expires'] : '');
+      $tls_host = isset($security_tls['host']) ? $security_tls['host'] : '';
+
+      if ($tls_valid || !empty($tls_issuer) || !empty($tls_valid_to)) {
+        $details = array();
+        if ($tls_status) $details[] = "Status: ".$tls_status;
+        if ($tls_version) $details[] = "Version: ".$tls_version;
+        if ($tls_issuer) $details[] = "Issuer: ".$tls_issuer;
+        if ($tls_provider) $details[] = "Provider: ".$tls_provider;
+        if ($tls_valid_from) $details[] = "Valid from: ".$tls_valid_from;
+        if ($tls_valid_to) $details[] = "Valid to: ".$tls_valid_to;
+        if ($tls_host) $details[] = "Host: ".$tls_host;
+
+        $answer = "Yes—TLS/SSL is active for ".$site_url." (".implode(', ', $details).").";
+      } else {
+        $answer = "I don't see SSL/TLS certificate information configured in your Visible Light Hub. Please check the SSL/TLS Status connector in the All Connections tab to ensure your certificate is properly configured.";
+      }
+    }
+    elseif (preg_match('/\bwordpress\b.*\bversion\b|\bwp\b.*\bversion\b/', $lc)) {
+      $v = isset($facts['wp_version']) ? trim((string)$facts['wp_version']) : '';
+      $answer = $v ? ("Your WordPress version is ".$v.".") : "I don't see a confirmed WordPress version in the Hub profile.";
+    }
+    elseif (preg_match('/\btheme\b.*\bactive\b|\bis.*theme.*active\b/', $lc)) {
+      $theme_active = isset($facts['theme_active']) ? (bool)$facts['theme_active'] : true;
+      $theme_name = isset($facts['theme']) ? (string)$facts['theme'] : '';
+      if ($theme_name) {
+        $answer = $theme_active ? ("Yes, the ".$theme_name." theme is currently active.") : ("No, the ".$theme_name." theme is not active.");
+      } else {
+        $answer = "I don't have confirmation on whether the current theme is active.";
+      }
+    }
+    elseif (preg_match('/\bwhat.*theme|\btheme.*name|\bcurrent.*theme\b/', $lc)) {
+      $theme_name = isset($facts['theme']) ? (string)$facts['theme'] : '';
+      $answer = $theme_name ? ("You are using the ".$theme_name." theme.") : "I don't see a confirmed theme in the Hub profile.";
+    }
+    elseif (preg_match('/\bhello\b|\bhi\b|\bhey\b/', $lc)) {
+      $answer = "Hello! I'm Luna, your friendly WebOps assistant. I have access to all your site data from Visible Light Hub. I can help you with WordPress version, themes, plugins, SSL status, and more. What would you like to know?";
+    }
+    elseif (preg_match('/\bup.*to.*date|\boutdated|\bupdate.*available\b/', $lc)) {
+      $updates = isset($facts['updates']) && is_array($facts['updates']) ? $facts['updates'] : array();
+      $core_updates = isset($updates['core']) ? (int)$updates['core'] : 0;
+      $plugin_updates = isset($updates['plugins']) ? (int)$updates['plugins'] : 0;
+      $theme_updates = isset($updates['themes']) ? (int)$updates['themes'] : 0;
+
+      if ($core_updates > 0 || $plugin_updates > 0 || $theme_updates > 0) {
+        $answer = "You have updates available: WordPress Core: ".$core_updates.", Plugins: ".$plugin_updates.", Themes: ".$theme_updates.". I recommend updating for security and performance.";
+      } else {
+        $answer = "Your WordPress installation appears to be up to date. No core, plugin, or theme updates are currently available.";
+      }
+    }
+    elseif (preg_match('/\bthreat.*protection|\bsecurity.*scan|\bmalware.*protection|\bthreat.*detection\b/', $lc)) {
+      $security_ids = isset($security['ids']) && is_array($security['ids']) ? $security['ids'] : array();
+      $ids_provider = isset($security_ids['provider']) ? $security_ids['provider'] : '';
+      $last_scan = isset($security_ids['last_scan']) ? $security_ids['last_scan'] : '';
+      $last_result = isset($security_ids['result']) ? $security_ids['result'] : '';
+      $scan_schedule = isset($security_ids['schedule']) ? $security_ids['schedule'] : '';
+
+      if ($ids_provider) {
+        $details = array();
+        $details[] = "Provider: ".$ids_provider;
+        if ($last_scan) $details[] = "Last scan: ".$last_scan;
+        if ($last_result) $details[] = "Last result: ".$last_result;
+        if ($scan_schedule) $details[] = "Schedule: ".$scan_schedule;
+
+        $answer = "Yes, you have threat protection set up (".implode(', ', $details)."). This helps protect against malware and security threats.";
+      } else {
+        $answer = "I don't see specific threat protection details in your security profile. You may want to consider adding a security plugin like Wordfence or Sucuri for malware protection.";
+      }
+    }
+    elseif (preg_match('/\bfirewall\b/', $lc)) {
+      $security_waf = isset($security['waf']) && is_array($security['waf']) ? $security['waf'] : array();
+      $waf_provider = isset($security_waf['provider']) ? $security_waf['provider'] : '';
+      $last_audit = isset($security_waf['last_audit']) ? $security_waf['last_audit'] : '';
+      if ($waf_provider) {
+        $answer = "Yes, you have a firewall configured. Your WAF provider is ".$waf_provider." with the last audit on ".$last_audit.". This helps block malicious traffic before it reaches your site.";
+      } else {
+        $answer = "I don't see a specific firewall configuration in your security profile. Consider adding a Web Application Firewall (WAF) for additional protection.";
+      }
+    }
+    // Enhanced keyword matching for AWS S3 queries
+    elseif (preg_match('/\b(aws.*s3|s3.*bucket|s3.*storage|amazon.*s3|bucket.*count|object.*count|storage.*used)\b/i', $lc)) {
+      $aws_s3 = isset($facts['aws_s3']) && is_array($facts['aws_s3']) ? $facts['aws_s3'] : array();
+      $connected = isset($aws_s3['connected']) ? (bool)$aws_s3['connected'] : false;
+      $bucket_count = isset($aws_s3['bucket_count']) ? (int)$aws_s3['bucket_count'] : 0;
+      $object_count = isset($aws_s3['object_count']) ? (int)$aws_s3['object_count'] : 0;
+      $storage_used = isset($aws_s3['storage_used']) ? $aws_s3['storage_used'] : 'N/A';
+      $last_sync = isset($aws_s3['last_sync']) ? $aws_s3['last_sync'] : '';
+      
+      if ($connected) {
+        $answer = "**Yes, you have AWS S3 configured!**\n\n";
+        $answer .= "**Connection Status:** Connected\n";
+        if ($bucket_count > 0) {
+          $answer .= "**Buckets:** " . $bucket_count . " bucket(s)\n";
+        }
+        if ($object_count > 0) {
+          $answer .= "**Objects:** " . number_format($object_count) . " objects\n";
+        }
+        if ($storage_used !== 'N/A') {
+          $answer .= "**Storage Used:** " . $storage_used . "\n";
+        }
+        if ($last_sync) {
+          $answer .= "**Last Sync:** " . date('M j, Y g:i A', strtotime($last_sync)) . "\n";
+        }
+        
+        if (!empty($aws_s3['buckets']) && is_array($aws_s3['buckets'])) {
+          $answer .= "\n**Buckets:**\n";
+          foreach (array_slice($aws_s3['buckets'], 0, 10) as $bucket) {
+            $bucket_name = isset($bucket['name']) ? $bucket['name'] : 'Unknown';
+            $bucket_objects = isset($bucket['object_count']) ? (int)$bucket['object_count'] : 0;
+            $bucket_size = isset($bucket['size']) ? $bucket['size'] : '0 B';
+            $answer .= "• " . $bucket_name . " - " . number_format($bucket_objects) . " objects, " . $bucket_size . "\n";
           }
-          $answer .= "\n";
+          if (count($aws_s3['buckets']) > 10) {
+            $answer .= "... and " . (count($aws_s3['buckets']) - 10) . " more buckets\n";
+          }
         }
       } else {
-    $answer = "Cloudflare is a popular CDN (Content Delivery Network) and security service that can improve your website's performance and protect it from threats. I don't see Cloudflare specifically configured in your current setup, but it's a great option to consider for faster loading times and enhanced security.";
+        $answer = "I don't see AWS S3 configured in your Visible Light Hub. AWS S3 is Amazon's cloud storage service that can be used for backups, media storage, and static asset hosting. You can connect AWS S3 in your Visible Light Hub profile.";
       }
     }
-  }
-  elseif (preg_match('/\bdns.*records|\bdns\b/', $lc)) {
-    $security_domain = isset($security['domain']) && is_array($security['domain']) ? $security['domain'] : array();
-    $dns_records = isset($security_domain['dns_records']) ? $security_domain['dns_records'] : '';
-    if ($dns_records) {
-      $answer = "Here are your DNS records: ".$dns_records.". These control how your domain points to your hosting server and other services.";
-    } else {
-      $answer = "I don't have your DNS records in the current profile. You can check these in your domain registrar's control panel or hosting provider's DNS management section.";
-    }
-  }
-  elseif (preg_match('/\blogin.*authenticator|\bauthenticator\b/', $lc)) {
-    $security_auth = isset($security['auth']) && is_array($security['auth']) ? $security['auth'] : array();
-    $mfa = isset($security_auth['mfa']) ? $security_auth['mfa'] : '';
-    if ($mfa) {
-      $answer = "Your login authentication is handled by ".$mfa.". This provides an extra layer of security beyond just passwords.";
-    } else {
-      $answer = "I don't see a specific authenticator configured in your security profile. Consider setting up two-factor authentication (2FA) for enhanced security.";
-    }
-  }
-  elseif (preg_match('/\bquestion\b/', $lc)) {
-    $answer = "Of course! I'm here to help. What would you like to know about your website?";
-  }
-  elseif (preg_match('/\bno\b/', $lc)) {
-    $answer = "No problem! Is there anything else I can help you with regarding your website?";
-  }
-  elseif (preg_match('/\b(thank\s?you|thanks|great|awesome|excellent|perfect)\b/', $lc)) {
-    $answer = "Glad I could help! Feel free to ask if you have any other questions about your site.";
-  }
-  elseif (preg_match('/\b(help|support|issue|problem|error|bug|broken|not working|trouble|stuck|confused|need assistance)\b/', $lc)) {
-    $answer = luna_analyze_help_request($prompt, $facts);
-  }
-  elseif (preg_match('/\b(support email|send email|email support)\b/', $lc)) {
-    $answer = luna_handle_help_option('support_email', $prompt, $facts);
-  }
-  elseif (preg_match('/\b(notify vl|notify visible light|alert vl|alert visible light)\b/', $lc)) {
-    $answer = luna_handle_help_option('notify_vl', $prompt, $facts);
-  }
-  elseif (preg_match('/\b(report bug|bug report|report as bug)\b/', $lc)) {
-    $answer = luna_handle_help_option('report_bug', $prompt, $facts);
-  }
-  elseif (preg_match('/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/', $prompt)) {
-    // Email address detected - send support email
-    $email = luna_extract_email($prompt);
-    if ($email) {
-      $success = luna_send_support_email($email, $prompt, $facts);
-      if ($success) {
-        $answer = "✅ Perfect! I've sent a detailed snapshot of our conversation and your site data to " . $email . ". You should receive it shortly. Is there anything else I can help you with?";
+    // Enhanced keyword matching for Liquid Web queries
+    elseif (preg_match('/\b(liquid.*web|liquidweb|hosting.*assets|server.*assets)\b/i', $lc)) {
+      $liquidweb = isset($facts['liquidweb']) && is_array($facts['liquidweb']) ? $facts['liquidweb'] : array();
+      $connected = isset($liquidweb['connected']) ? (bool)$liquidweb['connected'] : false;
+      $assets_count = isset($liquidweb['assets_count']) ? (int)$liquidweb['assets_count'] : 0;
+      $last_sync = isset($liquidweb['last_sync']) ? $liquidweb['last_sync'] : '';
+      
+      if ($connected) {
+        $answer = "**Yes, you have Liquid Web hosting configured!**\n\n";
+        $answer .= "**Connection Status:** Connected\n";
+        if ($assets_count > 0) {
+          $answer .= "**Assets:** " . $assets_count . " asset(s)\n";
+        }
+        if ($last_sync) {
+          $answer .= "**Last Sync:** " . date('M j, Y g:i A', strtotime($last_sync)) . "\n";
+        }
+        
+        if (!empty($liquidweb['assets']) && is_array($liquidweb['assets'])) {
+          $answer .= "\n**Assets:**\n";
+          foreach (array_slice($liquidweb['assets'], 0, 10) as $asset) {
+            $asset_name = isset($asset['name']) ? $asset['name'] : 'Unknown';
+            $asset_type = isset($asset['type']) ? $asset['type'] : 'N/A';
+            $asset_status = isset($asset['status']) ? $asset['status'] : 'unknown';
+            $answer .= "• " . $asset_name . " (" . $asset_type . ") - " . ucfirst($asset_status) . "\n";
+          }
+          if (count($liquidweb['assets']) > 10) {
+            $answer .= "... and " . (count($liquidweb['assets']) - 10) . " more assets\n";
+          }
+        }
       } else {
-        $answer = "I encountered an issue sending the email. Let me try notifying the Visible Light team instead - would you like me to do that?";
-      }
-    } else {
-      $answer = "I couldn't find a valid email address in your message. Could you please provide the email address where you'd like me to send the support snapshot?";
-    }
-  }
-  elseif (preg_match("/\bhow.*many.*inactive.*themes|\binactive.*themes\b/", $lc)) {
-    $inactive_themes = array();
-    if (isset($facts["themes"]) && is_array($facts["themes"])) {
-      foreach ($facts["themes"] as $theme) {
-        if (empty($theme["is_active"])) {
-          $inactive_themes[] = $theme["name"] . " v" . $theme["version"];
-        }
+        $answer = "I don't see Liquid Web hosting configured in your Visible Light Hub. Liquid Web is a managed hosting provider. You can connect Liquid Web in your Visible Light Hub profile.";
       }
     }
-    if (!empty($inactive_themes)) {
-      $answer = "You have " . count($inactive_themes) . " inactive themes: " . implode(", ", $inactive_themes) . ".";
-    } else {
-      $answer = "You have no inactive themes. All installed themes are currently active.";
-    }
-  }
-  elseif (preg_match("/\bhow.*many.*plugins|\bplugin.*count\b/", $lc)) {
-    $plugin_count = isset($facts["counts"]["plugins"]) ? (int)$facts["counts"]["plugins"] : 0;
-    $answer = "You currently have " . $plugin_count . " plugins installed.";
-  }
-  elseif (preg_match("/\b(list|names|show).*(pages|posts|content)\b|\b(pages|posts).*(list|names|show)\b/", $lc)) {
-    // List pages and/or posts with names
-    $pages_list = array();
-    $posts_list = array();
-    
-    if (isset($facts['pages']) && is_array($facts['pages']) && !empty($facts['pages'])) {
-      foreach ($facts['pages'] as $page) {
-        if (is_array($page)) {
-          $title = isset($page['title']) ? $page['title'] : (isset($page['name']) ? $page['name'] : 'Untitled Page');
-          $pages_list[] = $title;
-        } elseif (is_string($page)) {
-          $pages_list[] = $page;
-        }
-      }
-    }
-    
-    if (isset($facts['posts']) && is_array($facts['posts']) && !empty($facts['posts'])) {
-      foreach ($facts['posts'] as $post) {
-        if (is_array($post)) {
-          $title = isset($post['title']) ? $post['title'] : (isset($post['name']) ? $post['name'] : 'Untitled Post');
-          $posts_list[] = $title;
-        } elseif (is_string($post)) {
-          $posts_list[] = $post;
-        }
-      }
-    }
-    
-    $parts = array();
-    if (!empty($pages_list)) {
-      $pages_count = count($pages_list);
-      $parts[] = "**Pages (" . $pages_count . "):**\n" . implode("\n", array_map(function($title) { return "  • " . $title; }, array_slice($pages_list, 0, 50))); // Limit to 50 for readability
-      if ($pages_count > 50) {
-        $parts[count($parts) - 1] .= "\n  ... and " . ($pages_count - 50) . " more pages";
-      }
-    }
-    
-    if (!empty($posts_list)) {
-      $posts_count = count($posts_list);
-      $parts[] = "**Posts (" . $posts_count . "):**\n" . implode("\n", array_map(function($title) { return "  • " . $title; }, array_slice($posts_list, 0, 50))); // Limit to 50 for readability
-      if ($posts_count > 50) {
-        $parts[count($parts) - 1] .= "\n  ... and " . ($posts_count - 50) . " more posts";
-      }
-    }
-    
-    if (!empty($parts)) {
-      $answer = implode("\n\n", $parts);
-    } else {
-      $pages_count = isset($facts['counts']['pages']) ? (int)$facts['counts']['pages'] : 0;
-      $posts_count = isset($facts['counts']['posts']) ? (int)$facts['counts']['posts'] : 0;
-      $answer = "You have " . $pages_count . " pages and " . $posts_count . " posts on your site. However, I don't have the specific names of those pages and posts in the current data. If you need that information, you can check directly in your WordPress dashboard.";
-    }
-  }
-  elseif (preg_match("/\bwhat.*plugins|\blist.*plugins\b/", $lc)) {
-    if (isset($facts["plugins"]) && is_array($facts["plugins"]) && !empty($facts["plugins"])) {
-      $plugin_list = array();
-      foreach ($facts["plugins"] as $plugin) {
-        $status = !empty($plugin["active"]) ? "active" : "inactive";
-        $plugin_list[] = $plugin["name"] . " v" . $plugin["version"] . " (" . $status . ")";
-      }
-      $answer = "Your installed plugins are: " . implode(", ", $plugin_list) . ".";
-    } else {
-      $answer = "I don't see any plugins installed on your site.";
-    }
-  }
-  elseif (preg_match('/\b(competitor|competitors|competitor.*analysis|competitor.*report|domain.*ranking|vldr|vl.*dr|dr.*score|competitive.*analysis)\b/', $lc)) {
-    // Competitor analysis and domain ranking queries
-    error_log('[Luna Widget] Competitor query detected: ' . $prompt);
-    error_log('[Luna Widget] Checking facts for competitors: ' . print_r(isset($facts['competitors']) ? $facts['competitors'] : 'NOT SET', true));
-    error_log('[Luna Widget] Checking facts for competitor_reports: ' . print_r(isset($facts['competitor_reports']) ? count($facts['competitor_reports']) . ' reports' : 'NOT SET', true));
-    error_log('[Luna Widget] Checking facts for competitor_reports_full: ' . print_r(isset($facts['competitor_reports_full']) ? count($facts['competitor_reports_full']) . ' reports' : 'NOT SET', true));
-    error_log('[Luna Widget] Full facts keys: ' . print_r(array_keys($facts), true));
-    
-    // Collect ALL competitor data sources
-    $all_competitor_urls = array();
-    $all_competitor_reports = array();
-    
-    // Get competitor URLs from multiple sources
-    if (isset($facts['competitors']) && is_array($facts['competitors']) && !empty($facts['competitors'])) {
-      $all_competitor_urls = array_merge($all_competitor_urls, $facts['competitors']);
-    }
-    
-    // Get competitor reports from multiple sources
-    if (isset($facts['competitor_reports']) && is_array($facts['competitor_reports'])) {
-      $all_competitor_reports = array_merge($all_competitor_reports, $facts['competitor_reports']);
-    }
-    if (isset($facts['competitor_reports_full']) && is_array($facts['competitor_reports_full'])) {
-      $all_competitor_reports = array_merge($all_competitor_reports, $facts['competitor_reports_full']);
-    }
-    
-    // Extract competitor URLs from reports if available
-    if (!empty($all_competitor_reports)) {
-      foreach ($all_competitor_reports as $report_data) {
-        $comp_url = $report_data['url'] ?? '';
-        if (!empty($comp_url) && !in_array($comp_url, $all_competitor_urls)) {
-          $all_competitor_urls[] = $comp_url;
-        }
-      }
-    }
-    
-    // Try to extract a specific domain from the query
-    $query_domain = null;
-    if (preg_match('/\b([a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.(?:[a-zA-Z]{2,}|[a-zA-Z]{2,}\.[a-zA-Z]{2,}))\b/i', $prompt, $matches)) {
-      $query_domain = strtolower($matches[1]);
-      // Remove www. prefix if present
-      $query_domain = preg_replace('/^www\./', '', $query_domain);
-    }
-    
-    // If a specific domain was mentioned, search for it
-    if ($query_domain) {
-      error_log('[Luna Widget] Searching for specific domain: ' . $query_domain);
+    elseif (preg_match('/\bcdn\b/', $lc)) {
+      // Check if Cloudflare is connected (which provides CDN)
+      $cloudflare_data = isset($facts['cloudflare']) && is_array($facts['cloudflare']) ? $facts['cloudflare'] : array();
+      $cloudflare_connected = isset($cloudflare_data['connected']) ? (bool)$cloudflare_data['connected'] : false;
       
-      // Search in competitor reports (check all sources)
-      $found_report = null;
-      $reports_to_search = $all_competitor_reports;
-      
-      foreach ($reports_to_search as $report_data) {
-        $comp_url = $report_data['url'] ?? '';
-        $comp_domain = $report_data['domain'] ?? '';
-        if (empty($comp_domain) && !empty($comp_url)) {
-          $comp_domain = parse_url($comp_url, PHP_URL_HOST);
-        }
-        if ($comp_domain) {
-          $comp_domain = strtolower(preg_replace('/^www\./', '', $comp_domain));
-          if ($comp_domain === $query_domain) {
-            $found_report = $report_data;
-            break;
-          }
-        }
+      if ($cloudflare_connected) {
+        $answer = "Yes, you have a CDN configured through Cloudflare! Cloudflare provides a Content Delivery Network (CDN) that serves your content from locations closer to your visitors, improving performance and reducing load times.";
+      } else {
+        $answer = "I don't see a specific CDN configuration in your current profile. A CDN (Content Delivery Network) can improve your site's performance by serving content from locations closer to your visitors. Popular options include Cloudflare, MaxCDN, or KeyCDN.";
       }
-      
-      // Search in competitors list (check all sources)
-      $found_competitor = false;
-      foreach ($all_competitor_urls as $competitor_url) {
-        $domain = parse_url($competitor_url, PHP_URL_HOST);
-        if ($domain) {
-          $domain = strtolower(preg_replace('/^www\./', '', $domain));
-          if ($domain === $query_domain) {
-            $found_competitor = true;
-            break;
-          }
-        }
+    }
+    elseif (preg_match('/\bauthentication|\bmfa|\bpassword.*policy|\bsession.*timeout|\bsso\b/', $lc)) {
+      $security_auth = isset($security['auth']) && is_array($security['auth']) ? $security['auth'] : array();
+      $mfa = isset($security_auth['mfa']) ? $security_auth['mfa'] : '';
+      $password_policy = isset($security_auth['password_policy']) ? $security_auth['password_policy'] : '';
+      $session_timeout = isset($security_auth['session_timeout']) ? $security_auth['session_timeout'] : '';
+      $sso_providers = isset($security_auth['sso_providers']) ? $security_auth['sso_providers'] : '';
+
+      $details = array();
+      if ($mfa) $details[] = "MFA: ".$mfa;
+      if ($password_policy) $details[] = "Password Policy: ".$password_policy;
+      if ($session_timeout) $details[] = "Session Timeout: ".$session_timeout;
+      if ($sso_providers) $details[] = "SSO Providers: ".$sso_providers;
+
+      if (!empty($details)) {
+        $answer = "Your authentication settings (".implode(', ', $details).").";
+      } else {
+        $answer = "I don't see specific authentication details in your security profile. Consider setting up MFA, strong password policies, and appropriate session timeouts for better security.";
       }
+    }
+    elseif (preg_match('/\bdomain.*registrar|\bwho.*registered|\bdomain.*registered.*with\b/', $lc)) {
+      $security_domain = isset($security['domain']) && is_array($security['domain']) ? $security['domain'] : array();
+      $domain_name = isset($security_domain['domain']) ? $security_domain['domain'] : '';
+      $registrar = isset($security_domain['registrar']) ? $security_domain['registrar'] : '';
+      $registered_on = isset($security_domain['registered_on']) ? $security_domain['registered_on'] : '';
+      $renewal_date = isset($security_domain['renewal_date']) ? $security_domain['renewal_date'] : '';
+      $auto_renew = isset($security_domain['auto_renew']) ? $security_domain['auto_renew'] : '';
+      $dns_records = isset($security_domain['dns_records']) ? $security_domain['dns_records'] : '';
+
+      if ($registrar) {
+        $details = array();
+        if ($domain_name) $details[] = "Domain: ".$domain_name;
+        $details[] = "Registrar: ".$registrar;
+        if ($registered_on) $details[] = "Registered: ".$registered_on;
+        if ($renewal_date) $details[] = "Renewal: ".$renewal_date;
+        if ($auto_renew) $details[] = "Auto-renew: ".$auto_renew;
+        if ($dns_records) $details[] = "DNS Records: ".$dns_records;
+
+        $answer = "Your domain information (".implode(', ', $details).").";
+      } else {
+        $answer = "I don't have the domain registrar information in your current profile. You can check this in your domain management panel.";
+      }
+    }
+    elseif (preg_match('/\bblog.*title|\bcreate.*title|\bwrite.*title|\bcontent.*idea\b/', $lc)) {
+      $site_name = isset($facts['site_url']) ? parse_url($facts['site_url'], PHP_URL_HOST) : 'your website';
+      $theme_name = isset($facts['theme']) ? $facts['theme'] : 'your theme';
+      $answer = "Here are some blog title ideas for your new website: 'Welcome to ".$site_name." - A Fresh Digital Experience', 'Introducing Our New ".$theme_name."-Powered Website', 'Behind the Scenes: Building ".$site_name."', or 'What's New at ".$site_name." - A Complete Redesign'. Would you like me to suggest more specific topics?";
+    }
+    elseif (preg_match('/\bwhat.*can.*you.*do|\bwhat.*do.*you.*do|\bhelp.*with\b/', $lc)) {
+      $answer = "I can help you with information about your WordPress site, including themes, plugins, SSL status, pages, posts, users, security settings, domain information, analytics data (page views, users, sessions, bounce rate, engagement), and more. All data comes from your Visible Light Hub profile. What would you like to know?";
+    }
+    elseif (preg_match('/\b(web.*intelligence.*report|intelligence.*report|comprehensive.*report|full.*report|detailed.*report|complete.*analysis)\b/', $lc)) {
+      $answer = luna_generate_web_intelligence_report($facts);
+    }
+    elseif (preg_match('/\b(page.*views|pageviews|analytics|traffic|visitors|users|sessions|bounce.*rate|engagement)\b/', $lc)) {
+      $answer = luna_handle_analytics_request($prompt, $facts);
+    }
+    // Enhanced keyword matching for Cloudflare queries
+    elseif (preg_match('/\b(cloudflare|cdn|ddos|waf|web.*application.*firewall|content.*delivery.*network|cloudflare.*zone|cloudflare.*plan)\b/i', $lc)) {
+      // Check for Cloudflare data from comprehensive profile
+      $cloudflare_data = isset($facts['cloudflare']) && is_array($facts['cloudflare']) ? $facts['cloudflare'] : array();
+      $cloudflare_connected = isset($cloudflare_data['connected']) ? (bool)$cloudflare_data['connected'] : false;
       
-      // If we found a report, return detailed data
-      if ($found_report) {
-        $comp_url = $found_report['url'] ?? '';
-        $comp_domain = $found_report['domain'] ?? parse_url($comp_url, PHP_URL_HOST);
-        $report = $found_report['report'] ?? array();
-        $last_scanned = $found_report['last_scanned'] ?? null;
+      if ($cloudflare_connected) {
+        $zones_count = isset($cloudflare_data['zones_count']) ? (int)$cloudflare_data['zones_count'] : 0;
+        $account_id = isset($cloudflare_data['account_id']) ? $cloudflare_data['account_id'] : '';
+        $last_sync = isset($cloudflare_data['last_sync']) ? $cloudflare_data['last_sync'] : null;
+        $zones = isset($cloudflare_data['zones']) && is_array($cloudflare_data['zones']) ? $cloudflare_data['zones'] : array();
         
-        $answer = "**Competitor Analysis Report for " . $comp_domain . ":**\n\n";
-        
-        if ($last_scanned) {
-          $answer .= "**Last Scanned:** " . date('M j, Y g:i A', strtotime($last_scanned)) . "\n\n";
+        $answer = "**Yes, you have Cloudflare configured!**\n\n";
+        $answer .= "**Connection Status:** Connected\n";
+        if ($account_id) {
+          $answer .= "**Account ID:** " . $account_id . "\n";
+        }
+        if ($zones_count > 0) {
+          $answer .= "**Zones:** " . $zones_count . " zone(s)\n";
+        }
+        if ($last_sync) {
+          $answer .= "**Last Sync:** " . date('M j, Y g:i A', strtotime($last_sync)) . "\n";
         }
         
-        if (!empty($report)) {
-          // Handle both direct report data and nested report_json structure
-          $report_data = $report;
-          if (isset($report['report_json']) && is_array($report['report_json'])) {
-            $report_data = $report['report_json'];
-          }
-          
-          // Extract all available data from the report
-          if (!empty($report_data['lighthouse_score'])) {
-            $answer .= "**Lighthouse Score:** " . $report_data['lighthouse_score'] . "\n";
-          } elseif (isset($report_data['lighthouse']) && is_array($report_data['lighthouse'])) {
-            $lh = $report_data['lighthouse'];
-            if (!empty($lh['performance'])) {
-              $answer .= "**Lighthouse Performance Score:** " . $lh['performance'] . "\n";
-            }
-            if (!empty($lh['accessibility'])) {
-              $answer .= "**Lighthouse Accessibility Score:** " . $lh['accessibility'] . "\n";
-            }
-            if (!empty($lh['seo'])) {
-              $answer .= "**Lighthouse SEO Score:** " . $lh['seo'] . "\n";
-            }
-            if (!empty($lh['best_practices'])) {
-              $answer .= "**Lighthouse Best Practices Score:** " . $lh['best_practices'] . "\n";
-            }
-          }
-          
-          if (!empty($report_data['public_pages'])) {
-            $answer .= "**Public Pages Count:** " . $report_data['public_pages'] . "\n";
-          }
-          
-          if (!empty($report_data['blog']) && is_array($report_data['blog'])) {
-            $blog_status = isset($report_data['blog']['status']) ? $report_data['blog']['status'] : 'Unknown';
-            $answer .= "**Blog Status:** " . ucfirst($blog_status) . "\n";
-          }
-          
-          if (!empty($report_data['title'])) {
-            $answer .= "**Page Title:** " . $report_data['title'] . "\n";
-          }
-          
-          if (!empty($report_data['meta_description'])) {
-            $answer .= "**Meta Description:** " . substr($report_data['meta_description'], 0, 200) . "...\n";
-          }
-          
-          if (!empty($report_data['keywords']) && is_array($report_data['keywords'])) {
-            $top_keywords = array_slice($report_data['keywords'], 0, 10);
-            $answer .= "\n**Top Keywords:** " . implode(", ", $top_keywords) . "\n";
-          }
-          
-          if (!empty($report_data['keyphrases']) && is_array($report_data['keyphrases'])) {
-            $top_keyphrases = array_slice($report_data['keyphrases'], 0, 10);
-            $answer .= "**Top Keyphrases:** " . implode(", ", $top_keyphrases) . "\n";
+        if (!empty($zones)) {
+          $answer .= "\n**Configured Zones:**\n";
+          foreach ($zones as $zone) {
+            $zone_name = isset($zone['name']) ? $zone['name'] : 'Unknown';
+            $zone_status = isset($zone['status']) ? $zone['status'] : 'unknown';
+            $zone_plan = isset($zone['plan']) ? $zone['plan'] : 'Free';
+            $answer .= "• " . $zone_name . " (" . ucfirst($zone_status) . " - " . $zone_plan . " Plan)\n";
           }
         }
         
-        // Add VLDR data if available for this domain
-        if (isset($facts['vldr'][$query_domain])) {
-          $vldr_data = $facts['vldr'][$query_domain];
-          $answer .= "\n**Domain Ranking (VL-DR) Metrics:**\n";
-          if (isset($vldr_data['vldr_score'])) {
-            $score = (float) $vldr_data['vldr_score'];
-            $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
-            $answer .= "  - VL-DR Score: **" . number_format($score, 1) . "/100** (" . $color . ")\n";
-          }
-          if (isset($vldr_data['ref_domains'])) {
-            $answer .= "  - Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
-          }
-          if (isset($vldr_data['indexed_pages'])) {
-            $answer .= "  - Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
-          }
-          if (isset($vldr_data['lighthouse_avg'])) {
-            $answer .= "  - Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
-          }
-          if (isset($vldr_data['security_grade'])) {
-            $answer .= "  - Security Grade: **" . $vldr_data['security_grade'] . "**\n";
-          }
-          if (isset($vldr_data['domain_age_years'])) {
-            $answer .= "  - Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
-          }
-          if (isset($vldr_data['uptime_percent'])) {
-            $answer .= "  - Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
-          }
-          if (isset($vldr_data['metric_date'])) {
-            $answer .= "  - Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "\n";
+        $answer .= "\nCloudflare provides DDoS protection, Web Application Firewall (WAF), CDN caching, and DNS management for enhanced security and performance.";
+      } else {
+        // Check security data streams for Cloudflare
+        $security_streams = isset($facts['security_data_streams']) && is_array($facts['security_data_streams']) ? $facts['security_data_streams'] : array();
+        $cloudflare_streams = array();
+        foreach ($security_streams as $stream_id => $stream_data) {
+          if (strpos($stream_id, 'cloudflare') !== false || (isset($stream_data['name']) && strpos(strtolower($stream_data['name']), 'cloudflare') !== false)) {
+            $cloudflare_streams[$stream_id] = $stream_data;
           }
         }
-      } elseif ($found_competitor) {
-        // Domain is in competitors list but no report found - try to fetch VLDR data
-        if (isset($facts['vldr'][$query_domain])) {
-          $vldr_data = $facts['vldr'][$query_domain];
-          $answer = "**Competitor Analysis for " . $query_domain . ":**\n\n";
-          if (isset($vldr_data['vldr_score'])) {
-            $score = (float) $vldr_data['vldr_score'];
-            $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
-            $answer .= "**VL-DR Score: " . number_format($score, 1) . "/100** (" . $color . ")\n\n";
+        
+        if (!empty($cloudflare_streams)) {
+          $answer = "**Cloudflare Data Streams Found:**\n\n";
+          foreach ($cloudflare_streams as $stream_id => $stream_data) {
+            $stream_name = isset($stream_data['name']) ? $stream_data['name'] : 'Cloudflare Zone';
+            $stream_status = isset($stream_data['status']) ? $stream_data['status'] : 'unknown';
+            $health_score = isset($stream_data['health_score']) ? floatval($stream_data['health_score']) : 0;
+            $answer .= "• **" . $stream_name . "**\n";
+            $answer .= "  Status: " . ucfirst($stream_status) . "\n";
+            $answer .= "  Health Score: " . number_format($health_score, 1) . "%\n";
+            if (isset($stream_data['cloudflare_zone_name'])) {
+              $answer .= "  Zone: " . $stream_data['cloudflare_zone_name'] . "\n";
+            }
+            if (isset($stream_data['cloudflare_plan'])) {
+              $answer .= "  Plan: " . $stream_data['cloudflare_plan'] . "\n";
+            }
+            $answer .= "\n";
           }
-          $answer .= "**Detailed Metrics:**\n";
-          if (isset($vldr_data['ref_domains'])) {
-            $answer .= "• Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
-          }
-          if (isset($vldr_data['indexed_pages'])) {
-            $answer .= "• Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
-          }
-          if (isset($vldr_data['lighthouse_avg'])) {
-            $answer .= "• Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
-          }
-          if (isset($vldr_data['security_grade'])) {
-            $answer .= "• Security Grade: **" . $vldr_data['security_grade'] . "**\n";
-          }
-          if (isset($vldr_data['domain_age_years'])) {
-            $answer .= "• Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
-          }
-          if (isset($vldr_data['uptime_percent'])) {
-            $answer .= "• Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
-          }
-          if (isset($vldr_data['metric_date'])) {
-            $answer .= "\n*Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "*\n";
-          }
-          $answer .= "\n*Note: A detailed competitor analysis report may not be available. You can run a new analysis in your Visible Light Hub profile.*";
         } else {
-          $answer = "I found " . $query_domain . " in your competitor list, but I don't have a detailed analysis report for it yet. You can run a new competitor analysis for this domain in your Visible Light Hub profile.";
+      $answer = "Cloudflare is a popular CDN (Content Delivery Network) and security service that can improve your website's performance and protect it from threats. I don't see Cloudflare specifically configured in your current setup, but it's a great option to consider for faster loading times and enhanced security.";
         }
       }
-    } else {
-      // No specific domain mentioned - check if we have ANY competitor data
-      // Check for competitor reports first (most reliable source)
+    }
+    elseif (preg_match('/\bdns.*records|\bdns\b/', $lc)) {
+      $security_domain = isset($security['domain']) && is_array($security['domain']) ? $security['domain'] : array();
+      $dns_records = isset($security_domain['dns_records']) ? $security_domain['dns_records'] : '';
+      if ($dns_records) {
+        $answer = "Here are your DNS records: ".$dns_records.". These control how your domain points to your hosting server and other services.";
+      } else {
+        $answer = "I don't have your DNS records in the current profile. You can check these in your domain registrar's control panel or hosting provider's DNS management section.";
+      }
+    }
+    elseif (preg_match('/\blogin.*authenticator|\bauthenticator\b/', $lc)) {
+      $security_auth = isset($security['auth']) && is_array($security['auth']) ? $security['auth'] : array();
+      $mfa = isset($security_auth['mfa']) ? $security_auth['mfa'] : '';
+      if ($mfa) {
+        $answer = "Your login authentication is handled by ".$mfa.". This provides an extra layer of security beyond just passwords.";
+      } else {
+        $answer = "I don't see a specific authenticator configured in your security profile. Consider setting up two-factor authentication (2FA) for enhanced security.";
+      }
+    }
+    elseif (preg_match('/\bquestion\b/', $lc)) {
+      $answer = "Of course! I'm here to help. What would you like to know about your website?";
+    }
+    elseif (preg_match('/\bno\b/', $lc)) {
+      $answer = "No problem! Is there anything else I can help you with regarding your website?";
+    }
+    elseif (preg_match('/\b(thank\s?you|thanks|great|awesome|excellent|perfect)\b/', $lc)) {
+      $answer = "Glad I could help! Feel free to ask if you have any other questions about your site.";
+    }
+    elseif (preg_match('/\b(help|support|issue|problem|error|bug|broken|not working|trouble|stuck|confused|need assistance)\b/', $lc)) {
+      $answer = luna_analyze_help_request($prompt, $facts);
+    }
+    elseif (preg_match('/\b(support email|send email|email support)\b/', $lc)) {
+      $answer = luna_handle_help_option('support_email', $prompt, $facts);
+    }
+    elseif (preg_match('/\b(notify vl|notify visible light|alert vl|alert visible light)\b/', $lc)) {
+      $answer = luna_handle_help_option('notify_vl', $prompt, $facts);
+    }
+    elseif (preg_match('/\b(report bug|bug report|report as bug)\b/', $lc)) {
+      $answer = luna_handle_help_option('report_bug', $prompt, $facts);
+    }
+    elseif (preg_match('/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/', $prompt)) {
+      // Email address detected - send support email
+      $email = luna_extract_email($prompt);
+      if ($email) {
+        $success = luna_send_support_email($email, $prompt, $facts);
+        if ($success) {
+          $answer = "✅ Perfect! I've sent a detailed snapshot of our conversation and your site data to " . $email . ". You should receive it shortly. Is there anything else I can help you with?";
+        } else {
+          $answer = "I encountered an issue sending the email. Let me try notifying the Visible Light team instead - would you like me to do that?";
+        }
+      } else {
+        $answer = "I couldn't find a valid email address in your message. Could you please provide the email address where you'd like me to send the support snapshot?";
+      }
+    }
+    elseif (preg_match("/\bhow.*many.*inactive.*themes|\binactive.*themes\b/", $lc)) {
+      $inactive_themes = array();
+      if (isset($facts["themes"]) && is_array($facts["themes"])) {
+        foreach ($facts["themes"] as $theme) {
+          if (empty($theme["is_active"])) {
+            $inactive_themes[] = $theme["name"] . " v" . $theme["version"];
+          }
+        }
+      }
+      if (!empty($inactive_themes)) {
+        $answer = "You have " . count($inactive_themes) . " inactive themes: " . implode(", ", $inactive_themes) . ".";
+      } else {
+        $answer = "You have no inactive themes. All installed themes are currently active.";
+      }
+    }
+    elseif (preg_match("/\bhow.*many.*plugins|\bplugin.*count\b/", $lc)) {
+      $plugin_count = isset($facts["counts"]["plugins"]) ? (int)$facts["counts"]["plugins"] : 0;
+      $answer = "You currently have " . $plugin_count . " plugins installed.";
+    }
+    elseif (preg_match("/\b(list|names|show).*(pages|posts|content)\b|\b(pages|posts).*(list|names|show)\b/", $lc)) {
+      // List pages and/or posts with names
+      $pages_list = array();
+      $posts_list = array();
+      
+      if (isset($facts['pages']) && is_array($facts['pages']) && !empty($facts['pages'])) {
+        foreach ($facts['pages'] as $page) {
+          if (is_array($page)) {
+            $title = isset($page['title']) ? $page['title'] : (isset($page['name']) ? $page['name'] : 'Untitled Page');
+            $pages_list[] = $title;
+          } elseif (is_string($page)) {
+            $pages_list[] = $page;
+          }
+        }
+      }
+      
+      if (isset($facts['posts']) && is_array($facts['posts']) && !empty($facts['posts'])) {
+        foreach ($facts['posts'] as $post) {
+          if (is_array($post)) {
+            $title = isset($post['title']) ? $post['title'] : (isset($post['name']) ? $post['name'] : 'Untitled Post');
+            $posts_list[] = $title;
+          } elseif (is_string($post)) {
+            $posts_list[] = $post;
+          }
+        }
+      }
+      
+      $parts = array();
+      if (!empty($pages_list)) {
+        $pages_count = count($pages_list);
+        $parts[] = "**Pages (" . $pages_count . "):**\n" . implode("\n", array_map(function($title) { return "  • " . $title; }, array_slice($pages_list, 0, 50))); // Limit to 50 for readability
+        if ($pages_count > 50) {
+          $parts[count($parts) - 1] .= "\n  ... and " . ($pages_count - 50) . " more pages";
+        }
+      }
+      
+      if (!empty($posts_list)) {
+        $posts_count = count($posts_list);
+        $parts[] = "**Posts (" . $posts_count . "):**\n" . implode("\n", array_map(function($title) { return "  • " . $title; }, array_slice($posts_list, 0, 50))); // Limit to 50 for readability
+        if ($posts_count > 50) {
+          $parts[count($parts) - 1] .= "\n  ... and " . ($posts_count - 50) . " more posts";
+        }
+      }
+      
+      if (!empty($parts)) {
+        $answer = implode("\n\n", $parts);
+      } else {
+        $pages_count = isset($facts['counts']['pages']) ? (int)$facts['counts']['pages'] : 0;
+        $posts_count = isset($facts['counts']['posts']) ? (int)$facts['counts']['posts'] : 0;
+        $answer = "You have " . $pages_count . " pages and " . $posts_count . " posts on your site. However, I don't have the specific names of those pages and posts in the current data. If you need that information, you can check directly in your WordPress dashboard.";
+      }
+    }
+    elseif (preg_match("/\bwhat.*plugins|\blist.*plugins\b/", $lc)) {
+      if (isset($facts["plugins"]) && is_array($facts["plugins"]) && !empty($facts["plugins"])) {
+        $plugin_list = array();
+        foreach ($facts["plugins"] as $plugin) {
+          $status = !empty($plugin["active"]) ? "active" : "inactive";
+          $plugin_list[] = $plugin["name"] . " v" . $plugin["version"] . " (" . $status . ")";
+        }
+        $answer = "Your installed plugins are: " . implode(", ", $plugin_list) . ".";
+      } else {
+        $answer = "I don't see any plugins installed on your site.";
+      }
+    }
+    elseif (preg_match('/\b(competitor|competitors|competitor.*analysis|competitor.*report|domain.*ranking|vldr|vl.*dr|dr.*score|competitive.*analysis)\b/', $lc)) {
+      // Competitor analysis and domain ranking queries
+      error_log('[Luna Widget] Competitor query detected: ' . $prompt);
+      error_log('[Luna Widget] Checking facts for competitors: ' . print_r(isset($facts['competitors']) ? $facts['competitors'] : 'NOT SET', true));
+      error_log('[Luna Widget] Checking facts for competitor_reports: ' . print_r(isset($facts['competitor_reports']) ? count($facts['competitor_reports']) . ' reports' : 'NOT SET', true));
+      error_log('[Luna Widget] Checking facts for competitor_reports_full: ' . print_r(isset($facts['competitor_reports_full']) ? count($facts['competitor_reports_full']) . ' reports' : 'NOT SET', true));
+      error_log('[Luna Widget] Full facts keys: ' . print_r(array_keys($facts), true));
+      
+      // Collect ALL competitor data sources
+      $all_competitor_urls = array();
+      $all_competitor_reports = array();
+      
+      // Get competitor URLs from multiple sources
+      if (isset($facts['competitors']) && is_array($facts['competitors']) && !empty($facts['competitors'])) {
+        $all_competitor_urls = array_merge($all_competitor_urls, $facts['competitors']);
+      }
+      
+      // Get competitor reports from multiple sources
+      if (isset($facts['competitor_reports']) && is_array($facts['competitor_reports'])) {
+        $all_competitor_reports = array_merge($all_competitor_reports, $facts['competitor_reports']);
+      }
+      if (isset($facts['competitor_reports_full']) && is_array($facts['competitor_reports_full'])) {
+        $all_competitor_reports = array_merge($all_competitor_reports, $facts['competitor_reports_full']);
+      }
+      
+      // Extract competitor URLs from reports if available
       if (!empty($all_competitor_reports)) {
-        $competitor_list = array();
-        $competitor_details = array();
-        
         foreach ($all_competitor_reports as $report_data) {
+          $comp_url = $report_data['url'] ?? '';
+          if (!empty($comp_url) && !in_array($comp_url, $all_competitor_urls)) {
+            $all_competitor_urls[] = $comp_url;
+          }
+        }
+      }
+      
+      // Try to extract a specific domain from the query
+      $query_domain = null;
+      if (preg_match('/\b([a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.(?:[a-zA-Z]{2,}|[a-zA-Z]{2,}\.[a-zA-Z]{2,}))\b/i', $prompt, $matches)) {
+        $query_domain = strtolower($matches[1]);
+        // Remove www. prefix if present
+        $query_domain = preg_replace('/^www\./', '', $query_domain);
+      }
+      
+      // If a specific domain was mentioned, search for it
+      if ($query_domain) {
+        error_log('[Luna Widget] Searching for specific domain: ' . $query_domain);
+        
+        // Search in competitor reports (check all sources)
+        $found_report = null;
+        $reports_to_search = $all_competitor_reports;
+        
+        foreach ($reports_to_search as $report_data) {
           $comp_url = $report_data['url'] ?? '';
           $comp_domain = $report_data['domain'] ?? '';
           if (empty($comp_domain) && !empty($comp_url)) {
             $comp_domain = parse_url($comp_url, PHP_URL_HOST);
           }
-          if ($comp_domain && !in_array($comp_domain, $competitor_list)) {
-            $competitor_list[] = $comp_domain;
-            
-            // Extract report details
-            $report = $report_data['report'] ?? array();
-            $report_data_inner = $report;
-            if (isset($report['report_json']) && is_array($report['report_json'])) {
-              $report_data_inner = $report['report_json'];
+          if ($comp_domain) {
+            $comp_domain = strtolower(preg_replace('/^www\./', '', $comp_domain));
+            if ($comp_domain === $query_domain) {
+              $found_report = $report_data;
+              break;
             }
-            
-            $details = array();
-            if (!empty($report_data_inner['public_pages'])) {
-              $details['public_pages'] = $report_data_inner['public_pages'];
-            }
-            if (!empty($report_data_inner['blog']) && is_array($report_data_inner['blog'])) {
-              $blog_status = isset($report_data_inner['blog']['status']) ? $report_data_inner['blog']['status'] : 'Unknown';
-              $details['blog_status'] = ucfirst($blog_status);
-            }
-            if (!empty($report_data_inner['lighthouse_score'])) {
-              $details['lighthouse'] = $report_data_inner['lighthouse_score'];
-            } elseif (isset($report_data_inner['lighthouse']) && is_array($report_data_inner['lighthouse'])) {
-              $details['lighthouse'] = isset($report_data_inner['lighthouse']['performance']) ? $report_data_inner['lighthouse']['performance'] : 'N/A';
-            }
-            if (!empty($report_data['last_scanned'])) {
-              $details['last_scanned'] = $report_data['last_scanned'];
-            }
-            
-            // Get VLDR score if available
-            if (isset($facts['vldr'][$comp_domain])) {
-              $details['vldr_score'] = $facts['vldr'][$comp_domain]['vldr_score'] ?? null;
-            }
-            
-            $competitor_details[$comp_domain] = $details;
           }
         }
         
-        if (!empty($competitor_list)) {
-          $answer = "**Yes, you have " . count($competitor_list) . " competitor(s) listed with analysis reports:**\n\n";
+        // Search in competitors list (check all sources)
+        $found_competitor = false;
+        foreach ($all_competitor_urls as $competitor_url) {
+          $domain = parse_url($competitor_url, PHP_URL_HOST);
+          if ($domain) {
+            $domain = strtolower(preg_replace('/^www\./', '', $domain));
+            if ($domain === $query_domain) {
+              $found_competitor = true;
+              break;
+            }
+          }
+        }
+        
+        // If we found a report, return detailed data
+        if ($found_report) {
+          $comp_url = $found_report['url'] ?? '';
+          $comp_domain = $found_report['domain'] ?? parse_url($comp_url, PHP_URL_HOST);
+          $report = $found_report['report'] ?? array();
+          $last_scanned = $found_report['last_scanned'] ?? null;
           
-          foreach ($competitor_list as $domain) {
-            $answer .= "**" . $domain . "**\n";
-            $details = $competitor_details[$domain] ?? array();
+          $answer = "**Competitor Analysis Report for " . $comp_domain . ":**\n\n";
+          
+          if ($last_scanned) {
+            $answer .= "**Last Scanned:** " . date('M j, Y g:i A', strtotime($last_scanned)) . "\n\n";
+          }
+          
+          if (!empty($report)) {
+            // Handle both direct report data and nested report_json structure
+            $report_data = $report;
+            if (isset($report['report_json']) && is_array($report['report_json'])) {
+              $report_data = $report['report_json'];
+            }
             
-            if (!empty($details['public_pages'])) {
-              $answer .= "  • Public Pages: " . $details['public_pages'] . "\n";
+            // Extract all available data from the report
+            if (!empty($report_data['lighthouse_score'])) {
+              $answer .= "**Lighthouse Score:** " . $report_data['lighthouse_score'] . "\n";
+            } elseif (isset($report_data['lighthouse']) && is_array($report_data['lighthouse'])) {
+              $lh = $report_data['lighthouse'];
+              if (!empty($lh['performance'])) {
+                $answer .= "**Lighthouse Performance Score:** " . $lh['performance'] . "\n";
+              }
+              if (!empty($lh['accessibility'])) {
+                $answer .= "**Lighthouse Accessibility Score:** " . $lh['accessibility'] . "\n";
+              }
+              if (!empty($lh['seo'])) {
+                $answer .= "**Lighthouse SEO Score:** " . $lh['seo'] . "\n";
+              }
+              if (!empty($lh['best_practices'])) {
+                $answer .= "**Lighthouse Best Practices Score:** " . $lh['best_practices'] . "\n";
+              }
             }
-            if (!empty($details['blog_status'])) {
-              $answer .= "  • Blog Status: " . $details['blog_status'] . "\n";
+            
+            if (!empty($report_data['public_pages'])) {
+              $answer .= "**Public Pages Count:** " . $report_data['public_pages'] . "\n";
             }
-            if (!empty($details['lighthouse'])) {
-              $answer .= "  • Lighthouse Score: " . $details['lighthouse'] . "\n";
+            
+            if (!empty($report_data['blog']) && is_array($report_data['blog'])) {
+              $blog_status = isset($report_data['blog']['status']) ? $report_data['blog']['status'] : 'Unknown';
+              $answer .= "**Blog Status:** " . ucfirst($blog_status) . "\n";
             }
-            if (!empty($details['vldr_score'])) {
-              $answer .= "  • Domain Ranking (VL-DR): " . number_format($details['vldr_score'], 2) . "/100\n";
+            
+            if (!empty($report_data['title'])) {
+              $answer .= "**Page Title:** " . $report_data['title'] . "\n";
             }
-            if (!empty($details['last_scanned'])) {
-              $answer .= "  • Last Scanned: " . date('M j, Y g:i A', strtotime($details['last_scanned'])) . "\n";
+            
+            if (!empty($report_data['meta_description'])) {
+              $answer .= "**Meta Description:** " . substr($report_data['meta_description'], 0, 200) . "...\n";
             }
-            $answer .= "\n";
+            
+            if (!empty($report_data['keywords']) && is_array($report_data['keywords'])) {
+              $top_keywords = array_slice($report_data['keywords'], 0, 10);
+              $answer .= "\n**Top Keywords:** " . implode(", ", $top_keywords) . "\n";
+            }
+            
+            if (!empty($report_data['keyphrases']) && is_array($report_data['keyphrases'])) {
+              $top_keyphrases = array_slice($report_data['keyphrases'], 0, 10);
+              $answer .= "**Top Keyphrases:** " . implode(", ", $top_keyphrases) . "\n";
+            }
           }
           
-          $first_competitor = !empty($competitor_list) ? $competitor_list[0] : 'your competitor';
-          $answer .= "You can ask me about a specific competitor by mentioning their domain name, for example: \"What's the competitor analysis for " . $first_competitor . "?\"\n\n";
-          
-          // Add VLDR data if available
-          if (isset($facts['vldr']) && is_array($facts['vldr']) && !empty($facts['vldr'])) {
-            $answer .= "**Domain Ranking (VL-DR) Scores:**\n";
-            foreach ($facts['vldr'] as $domain => $vldr_data) {
-              $is_client = isset($vldr_data['is_client']) && $vldr_data['is_client'];
-              $label = $is_client ? "Your Domain" : "Competitor";
-              $answer .= "\n" . $label . ": **" . $domain . "**\n";
-              if (isset($vldr_data['vldr_score'])) {
-                $score = (float) $vldr_data['vldr_score'];
-                $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
-                $answer .= "  - VL-DR Score: **" . number_format($score, 1) . "/100** (" . $color . ")\n";
-              }
-              if (isset($vldr_data['ref_domains'])) {
-                $answer .= "  - Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
-              }
-              if (isset($vldr_data['indexed_pages'])) {
-                $answer .= "  - Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
-              }
-              if (isset($vldr_data['lighthouse_avg'])) {
-                $answer .= "  - Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
-              }
-              if (isset($vldr_data['security_grade'])) {
-                $answer .= "  - Security Grade: **" . $vldr_data['security_grade'] . "**\n";
-              }
-              if (isset($vldr_data['domain_age_years'])) {
-                $answer .= "  - Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
-              }
-              if (isset($vldr_data['uptime_percent'])) {
-                $answer .= "  - Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
-              }
-              if (isset($vldr_data['metric_date'])) {
-                $answer .= "  - Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "\n";
-              }
+          // Add VLDR data if available for this domain
+          if (isset($facts['vldr'][$query_domain])) {
+            $vldr_data = $facts['vldr'][$query_domain];
+            $answer .= "\n**Domain Ranking (VL-DR) Metrics:**\n";
+            if (isset($vldr_data['vldr_score'])) {
+              $score = (float) $vldr_data['vldr_score'];
+              $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
+              $answer .= "  - VL-DR Score: **" . number_format($score, 1) . "/100** (" . $color . ")\n";
             }
-            $answer .= "\n*VL-DR is computed from public indicators: Common Crawl/Index, Bing Web Search, SecurityHeaders.com, WHOIS, Visible Light Uptime monitoring, and Lighthouse performance scores.*\n";
+            if (isset($vldr_data['ref_domains'])) {
+              $answer .= "  - Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
+            }
+            if (isset($vldr_data['indexed_pages'])) {
+              $answer .= "  - Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
+            }
+            if (isset($vldr_data['lighthouse_avg'])) {
+              $answer .= "  - Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
+            }
+            if (isset($vldr_data['security_grade'])) {
+              $answer .= "  - Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+            }
+            if (isset($vldr_data['domain_age_years'])) {
+              $answer .= "  - Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
+            }
+            if (isset($vldr_data['uptime_percent'])) {
+              $answer .= "  - Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
+            }
+            if (isset($vldr_data['metric_date'])) {
+              $answer .= "  - Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "\n";
+            }
           }
-        } elseif (!empty($all_competitor_urls)) {
-          // Have competitor URLs but no reports yet
+        } elseif ($found_competitor) {
+          // Domain is in competitors list but no report found - try to fetch VLDR data
+          if (isset($facts['vldr'][$query_domain])) {
+            $vldr_data = $facts['vldr'][$query_domain];
+            $answer = "**Competitor Analysis for " . $query_domain . ":**\n\n";
+            if (isset($vldr_data['vldr_score'])) {
+              $score = (float) $vldr_data['vldr_score'];
+              $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
+              $answer .= "**VL-DR Score: " . number_format($score, 1) . "/100** (" . $color . ")\n\n";
+            }
+            $answer .= "**Detailed Metrics:**\n";
+            if (isset($vldr_data['ref_domains'])) {
+              $answer .= "• Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
+            }
+            if (isset($vldr_data['indexed_pages'])) {
+              $answer .= "• Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
+            }
+            if (isset($vldr_data['lighthouse_avg'])) {
+              $answer .= "• Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
+            }
+            if (isset($vldr_data['security_grade'])) {
+              $answer .= "• Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+            }
+            if (isset($vldr_data['domain_age_years'])) {
+              $answer .= "• Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
+            }
+            if (isset($vldr_data['uptime_percent'])) {
+              $answer .= "• Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
+            }
+            if (isset($vldr_data['metric_date'])) {
+              $answer .= "\n*Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "*\n";
+            }
+            $answer .= "\n*Note: A detailed competitor analysis report may not be available. You can run a new analysis in your Visible Light Hub profile.*";
+          } else {
+            $answer = "I found " . $query_domain . " in your competitor list, but I don't have a detailed analysis report for it yet. You can run a new competitor analysis for this domain in your Visible Light Hub profile.";
+          }
+        }
+      } else {
+        // No specific domain mentioned - check if we have ANY competitor data
+        // Check for competitor reports first (most reliable source)
+        if (!empty($all_competitor_reports)) {
           $competitor_list = array();
-          foreach ($all_competitor_urls as $competitor_url) {
-            $domain = parse_url($competitor_url, PHP_URL_HOST);
-            if ($domain) {
-              $competitor_list[] = $domain;
+          $competitor_details = array();
+          
+          foreach ($all_competitor_reports as $report_data) {
+            $comp_url = $report_data['url'] ?? '';
+            $comp_domain = $report_data['domain'] ?? '';
+            if (empty($comp_domain) && !empty($comp_url)) {
+              $comp_domain = parse_url($comp_url, PHP_URL_HOST);
+            }
+            if ($comp_domain && !in_array($comp_domain, $competitor_list)) {
+              $competitor_list[] = $comp_domain;
+              
+              // Extract report details
+              $report = $report_data['report'] ?? array();
+              $report_data_inner = $report;
+              if (isset($report['report_json']) && is_array($report['report_json'])) {
+                $report_data_inner = $report['report_json'];
+              }
+              
+              $details = array();
+              if (!empty($report_data_inner['public_pages'])) {
+                $details['public_pages'] = $report_data_inner['public_pages'];
+              }
+              if (!empty($report_data_inner['blog']) && is_array($report_data_inner['blog'])) {
+                $blog_status = isset($report_data_inner['blog']['status']) ? $report_data_inner['blog']['status'] : 'Unknown';
+                $details['blog_status'] = ucfirst($blog_status);
+              }
+              if (!empty($report_data_inner['lighthouse_score'])) {
+                $details['lighthouse'] = $report_data_inner['lighthouse_score'];
+              } elseif (isset($report_data_inner['lighthouse']) && is_array($report_data_inner['lighthouse'])) {
+                $details['lighthouse'] = isset($report_data_inner['lighthouse']['performance']) ? $report_data_inner['lighthouse']['performance'] : 'N/A';
+              }
+              if (!empty($report_data['last_scanned'])) {
+                $details['last_scanned'] = $report_data['last_scanned'];
+              }
+              
+              // Get VLDR score if available
+              if (isset($facts['vldr'][$comp_domain])) {
+                $details['vldr_score'] = $facts['vldr'][$comp_domain]['vldr_score'] ?? null;
+              }
+              
+              $competitor_details[$comp_domain] = $details;
             }
           }
           
           if (!empty($competitor_list)) {
-            $answer = "You have " . count($competitor_list) . " competitor(s) listed: " . implode(", ", $competitor_list) . ".\n\n";
-            $answer .= "However, I don't have detailed analysis reports for them yet. You can run a competitor analysis in your Visible Light Hub profile to generate reports with Lighthouse scores, keywords, and domain rankings.\n\n";
+            $answer = "**Yes, you have " . count($competitor_list) . " competitor(s) listed with analysis reports:**\n\n";
+            
+            foreach ($competitor_list as $domain) {
+              $answer .= "**" . $domain . "**\n";
+              $details = $competitor_details[$domain] ?? array();
+              
+              if (!empty($details['public_pages'])) {
+                $answer .= "  • Public Pages: " . $details['public_pages'] . "\n";
+              }
+              if (!empty($details['blog_status'])) {
+                $answer .= "  • Blog Status: " . $details['blog_status'] . "\n";
+              }
+              if (!empty($details['lighthouse'])) {
+                $answer .= "  • Lighthouse Score: " . $details['lighthouse'] . "\n";
+              }
+              if (!empty($details['vldr_score'])) {
+                $answer .= "  • Domain Ranking (VL-DR): " . number_format($details['vldr_score'], 2) . "/100\n";
+              }
+              if (!empty($details['last_scanned'])) {
+                $answer .= "  • Last Scanned: " . date('M j, Y g:i A', strtotime($details['last_scanned'])) . "\n";
+              }
+              $answer .= "\n";
+            }
+            
+            $first_competitor = !empty($competitor_list) ? $competitor_list[0] : 'your competitor';
+            $answer .= "You can ask me about a specific competitor by mentioning their domain name, for example: \"What's the competitor analysis for " . $first_competitor . "?\"\n\n";
             
             // Add VLDR data if available
             if (isset($facts['vldr']) && is_array($facts['vldr']) && !empty($facts['vldr'])) {
-              $answer .= "**Domain Ranking (VL-DR) Scores Available:**\n";
+              $answer .= "**Domain Ranking (VL-DR) Scores:**\n";
               foreach ($facts['vldr'] as $domain => $vldr_data) {
-                if (in_array($domain, $competitor_list)) {
-                  $answer .= "\n**" . $domain . ":**\n";
-                  if (isset($vldr_data['vldr_score'])) {
-                    $score = (float) $vldr_data['vldr_score'];
-                    $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
-                    $answer .= "  - VL-DR Score: **" . number_format($score, 1) . "/100** (" . $color . ")\n";
-                  }
-                  if (isset($vldr_data['ref_domains'])) {
-                    $answer .= "  - Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
-                  }
-                  if (isset($vldr_data['indexed_pages'])) {
-                    $answer .= "  - Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
-                  }
-                  if (isset($vldr_data['lighthouse_avg'])) {
-                    $answer .= "  - Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
-                  }
-                  if (isset($vldr_data['security_grade'])) {
-                    $answer .= "  - Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+                $is_client = isset($vldr_data['is_client']) && $vldr_data['is_client'];
+                $label = $is_client ? "Your Domain" : "Competitor";
+                $answer .= "\n" . $label . ": **" . $domain . "**\n";
+                if (isset($vldr_data['vldr_score'])) {
+                  $score = (float) $vldr_data['vldr_score'];
+                  $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
+                  $answer .= "  - VL-DR Score: **" . number_format($score, 1) . "/100** (" . $color . ")\n";
+                }
+                if (isset($vldr_data['ref_domains'])) {
+                  $answer .= "  - Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
+                }
+                if (isset($vldr_data['indexed_pages'])) {
+                  $answer .= "  - Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
+                }
+                if (isset($vldr_data['lighthouse_avg'])) {
+                  $answer .= "  - Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
+                }
+                if (isset($vldr_data['security_grade'])) {
+                  $answer .= "  - Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+                }
+                if (isset($vldr_data['domain_age_years'])) {
+                  $answer .= "  - Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
+                }
+                if (isset($vldr_data['uptime_percent'])) {
+                  $answer .= "  - Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
+                }
+                if (isset($vldr_data['metric_date'])) {
+                  $answer .= "  - Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "\n";
+                }
+              }
+              $answer .= "\n*VL-DR is computed from public indicators: Common Crawl/Index, Bing Web Search, SecurityHeaders.com, WHOIS, Visible Light Uptime monitoring, and Lighthouse performance scores.*\n";
+            }
+          } elseif (!empty($all_competitor_urls)) {
+            // Have competitor URLs but no reports yet
+            $competitor_list = array();
+            foreach ($all_competitor_urls as $competitor_url) {
+              $domain = parse_url($competitor_url, PHP_URL_HOST);
+              if ($domain) {
+                $competitor_list[] = $domain;
+              }
+            }
+            
+            if (!empty($competitor_list)) {
+              $answer = "You have " . count($competitor_list) . " competitor(s) listed: " . implode(", ", $competitor_list) . ".\n\n";
+              $answer .= "However, I don't have detailed analysis reports for them yet. You can run a competitor analysis in your Visible Light Hub profile to generate reports with Lighthouse scores, keywords, and domain rankings.\n\n";
+              
+              // Add VLDR data if available
+              if (isset($facts['vldr']) && is_array($facts['vldr']) && !empty($facts['vldr'])) {
+                $answer .= "**Domain Ranking (VL-DR) Scores Available:**\n";
+                foreach ($facts['vldr'] as $domain => $vldr_data) {
+                  if (in_array($domain, $competitor_list)) {
+                    $answer .= "\n**" . $domain . ":**\n";
+                    if (isset($vldr_data['vldr_score'])) {
+                      $score = (float) $vldr_data['vldr_score'];
+                      $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
+                      $answer .= "  - VL-DR Score: **" . number_format($score, 1) . "/100** (" . $color . ")\n";
+                    }
+                    if (isset($vldr_data['ref_domains'])) {
+                      $answer .= "  - Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
+                    }
+                    if (isset($vldr_data['indexed_pages'])) {
+                      $answer .= "  - Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
+                    }
+                    if (isset($vldr_data['lighthouse_avg'])) {
+                      $answer .= "  - Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
+                    }
+                    if (isset($vldr_data['security_grade'])) {
+                      $answer .= "  - Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+                    }
                   }
                 }
               }
+            } else {
+              $answer = "I don't see any competitor analysis data configured. You can set up competitor analysis in your Visible Light Hub profile to track competitor domains and their performance metrics.";
             }
           } else {
             $answer = "I don't see any competitor analysis data configured. You can set up competitor analysis in your Visible Light Hub profile to track competitor domains and their performance metrics.";
           }
-        } else {
-          $answer = "I don't see any competitor analysis data configured. You can set up competitor analysis in your Visible Light Hub profile to track competitor domains and their performance metrics.";
         }
       }
     }
-  }
-  elseif (preg_match('/\b(domain.*rank|vldr|vl.*dr|dr.*score|ranking.*score)\b/', $lc) && preg_match('/\b(astronomer|siteassembly|nvidia|competitor|competitors)\b/i', $prompt)) {
-    // Specific domain ranking query
-    $domain_match = null;
-    if (preg_match('/\b(astronomer\.io|siteassembly\.com|nvidia\.com)\b/i', $prompt, $matches)) {
-      $domain_match = strtolower($matches[1]);
-    } elseif (preg_match('/\b(astronomer|siteassembly|nvidia)\b/i', $prompt, $matches)) {
-      $domain_lookup = array(
-        'astronomer' => 'astronomer.io',
-        'siteassembly' => 'siteassembly.com',
-        'nvidia' => 'nvidia.com',
-      );
-      $key = strtolower($matches[1]);
-      if (isset($domain_lookup[$key])) {
-        $domain_match = $domain_lookup[$key];
+    elseif (preg_match('/\b(domain.*rank|vldr|vl.*dr|dr.*score|ranking.*score)\b/', $lc) && preg_match('/\b(astronomer|siteassembly|nvidia|competitor|competitors)\b/i', $prompt)) {
+      // Specific domain ranking query
+      $domain_match = null;
+      if (preg_match('/\b(astronomer\.io|siteassembly\.com|nvidia\.com)\b/i', $prompt, $matches)) {
+        $domain_match = strtolower($matches[1]);
+      } elseif (preg_match('/\b(astronomer|siteassembly|nvidia)\b/i', $prompt, $matches)) {
+        $domain_lookup = array(
+          'astronomer' => 'astronomer.io',
+          'siteassembly' => 'siteassembly.com',
+          'nvidia' => 'nvidia.com',
+        );
+        $key = strtolower($matches[1]);
+        if (isset($domain_lookup[$key])) {
+          $domain_match = $domain_lookup[$key];
+        }
+      }
+      
+      if ($domain_match && isset($facts['vldr'][$domain_match])) {
+        $vldr_data = $facts['vldr'][$domain_match];
+        $answer = "**Domain Ranking for " . $domain_match . ":**\n\n";
+        if (isset($vldr_data['vldr_score'])) {
+          $score = (float) $vldr_data['vldr_score'];
+          $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
+          $answer .= "**VL-DR Score: " . number_format($score, 1) . "/100** (" . $color . ")\n\n";
+        }
+        $answer .= "**Detailed Metrics:**\n";
+        if (isset($vldr_data['ref_domains'])) {
+          $answer .= "• Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
+        }
+        if (isset($vldr_data['indexed_pages'])) {
+          $answer .= "• Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
+        }
+        if (isset($vldr_data['lighthouse_avg'])) {
+          $answer .= "• Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
+        }
+        if (isset($vldr_data['security_grade'])) {
+          $answer .= "• Security Grade: **" . $vldr_data['security_grade'] . "**\n";
+        }
+        if (isset($vldr_data['domain_age_years'])) {
+          $answer .= "• Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
+        }
+        if (isset($vldr_data['uptime_percent'])) {
+          $answer .= "• Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
+        }
+        if (isset($vldr_data['metric_date'])) {
+          $answer .= "\n*Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "*\n";
+        }
+        $answer .= "\n*VL-DR is computed from public indicators: Common Crawl/Index, Bing Web Search, SecurityHeaders.com, WHOIS, Visible Light Uptime monitoring, and Lighthouse performance scores.*";
+      } else {
+        $answer = "I don't have domain ranking data for that domain. Make sure competitor analysis is set up in your Visible Light Hub profile for the domain you're asking about.";
       }
     }
-    
-    if ($domain_match && isset($facts['vldr'][$domain_match])) {
-      $vldr_data = $facts['vldr'][$domain_match];
-      $answer = "**Domain Ranking for " . $domain_match . ":**\n\n";
-      if (isset($vldr_data['vldr_score'])) {
-        $score = (float) $vldr_data['vldr_score'];
-        $color = $score >= 80 ? "excellent" : ($score >= 60 ? "good" : ($score >= 40 ? "fair" : "needs improvement"));
-        $answer .= "**VL-DR Score: " . number_format($score, 1) . "/100** (" . $color . ")\n\n";
-      }
-      $answer .= "**Detailed Metrics:**\n";
-      if (isset($vldr_data['ref_domains'])) {
-        $answer .= "• Referring Domains: ~" . number_format($vldr_data['ref_domains'] / 1000, 1) . "k\n";
-      }
-      if (isset($vldr_data['indexed_pages'])) {
-        $answer .= "• Indexed Pages: ~" . number_format($vldr_data['indexed_pages'] / 1000, 1) . "k\n";
-      }
-      if (isset($vldr_data['lighthouse_avg'])) {
-        $answer .= "• Lighthouse Average: " . $vldr_data['lighthouse_avg'] . "\n";
-      }
-      if (isset($vldr_data['security_grade'])) {
-        $answer .= "• Security Grade: **" . $vldr_data['security_grade'] . "**\n";
-      }
-      if (isset($vldr_data['domain_age_years'])) {
-        $answer .= "• Domain Age: " . number_format($vldr_data['domain_age_years'], 1) . " years\n";
-      }
-      if (isset($vldr_data['uptime_percent'])) {
-        $answer .= "• Uptime: " . number_format($vldr_data['uptime_percent'], 2) . "%\n";
-      }
-      if (isset($vldr_data['metric_date'])) {
-        $answer .= "\n*Last Updated: " . date('M j, Y', strtotime($vldr_data['metric_date'])) . "*\n";
-      }
-      $answer .= "\n*VL-DR is computed from public indicators: Common Crawl/Index, Bing Web Search, SecurityHeaders.com, WHOIS, Visible Light Uptime monitoring, and Lighthouse performance scores.*";
-    } else {
-      $answer = "I don't have domain ranking data for that domain. Make sure competitor analysis is set up in your Visible Light Hub profile for the domain you're asking about.";
-    }
-  }
 
-  if ($answer === '') {
-    $facts_source = isset($facts['__source']) ? $facts['__source'] : ((isset($facts['comprehensive']) && $facts['comprehensive']) ? 'comprehensive' : 'basic');
-    if ($facts_source !== 'comprehensive') {
-      $canned = luna_widget_find_canned_response($prompt);
-      if (is_array($canned) && !empty($canned['content'])) {
-        $answer = $canned['content'];
-        $meta['source'] = 'canned_response';
-        $meta['canned_id'] = $canned['id'];
-        if (!empty($canned['title'])) {
-          $meta['canned_title'] = $canned['title'];
-        }
-      }
-    }
   }
 
   // For Luna Composer, ALWAYS use OpenAI to generate long-form, thoughtful, hyper-personal responses
   // Skip deterministic answers for composer requests to ensure all responses are AI-generated
   if ($is_composer && $answer === '') {
     // For Luna Composer, ALWAYS generate long-form, thoughtful, hyper-personal responses
-    $enhanced_prompt = "You are Luna Composer, a sophisticated AI writing assistant that generates long-form, thoughtful, and hyper-personal data-driven content. The user is using Luna Composer to create editable long-form content, so your response must be comprehensive, well-structured, and suitable for professional editing. Write in a thoughtful, engaging, and personable manner that feels human and authentic, not robotic. Use full sentences, proper paragraph breaks, and narrative-style explanations. Include relevant data and insights from the provided facts, but weave them naturally into a cohesive narrative. Make the content feel personalized and tailored to the user's specific needs. NEVER use emoticons, emojis, unicode symbols, or special characters. Use plain text only. Generate a substantial, detailed response (minimum 300-500 words for simple queries, 800-1200+ words for complex queries) that provides real value and can be edited into polished content.\n\nUser request: " . $prompt;
+    $enhanced_prompt = "You are Luna Composer, a sophisticated AI writing assistant that generates long-form, thoughtful, and hyper-personal data-driven content. The user is using Luna Composer to create editable long-form content, so your response must be comprehensive, well-structured, and suitable for professional editing. Write in a thoughtful, engaging, and personable manner that feels human and authentic, not robotic. Use full sentences, proper paragraph breaks, and narrative-style explanations. Include relevant data and insights from the provided facts, but weave them naturally into a cohesive narrative. Make the content feel personalized and tailored to the user's specific needs. Analyze the data, highlight trends, call out risks or opportunities, and provide strategic recommendations or next steps so the user receives meaningful guidance rather than just raw metrics. When data is missing or limited, acknowledge the gap and recommend how to close it. NEVER use emoticons, emojis, unicode symbols, or special characters. Use plain text only. Each time you receive a prompt, craft a fresh perspective so repeated prompts still feel new and insightful. Generate a substantial, detailed response (minimum 300-500 words for simple queries, 800-1200+ words for complex queries) that provides real value and can be edited into polished content.\n\nUser request: " . $prompt;
     
     // Mark this as a composer request in facts for the OpenAI function
     $facts['__composer'] = true;
