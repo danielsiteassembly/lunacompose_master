@@ -4258,9 +4258,46 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   
   // If greeting is part of a larger question, let it proceed to normal processing
 
-  $context = $req->get_param('context');
-  $context = is_string($context) ? sanitize_key($context) : '';
-  $is_composer = ($context === 'composer');
+  $raw_context = $req->get_param('context');
+  $context     = is_string($raw_context) ? sanitize_key($raw_context) : '';
+
+  $is_composer = false;
+  $composer_markers = array();
+
+  if (is_string($raw_context)) {
+    $normalized = strtolower(trim($raw_context));
+    if ($normalized !== '') {
+      $composer_markers[] = $normalized;
+      $composer_markers[] = str_replace(array('/', '\\', '-'), '_', $normalized);
+    }
+  }
+
+  if ($context !== '') {
+    $composer_markers[] = $context;
+  }
+
+  $mode_param = $req->get_param('mode');
+  if (is_string($mode_param)) {
+    $mode_normalized = strtolower(trim($mode_param));
+    if ($mode_normalized !== '') {
+      $composer_markers[] = $mode_normalized;
+      $composer_markers[] = str_replace(array('/', '\\', '-'), '_', $mode_normalized);
+    }
+  }
+
+  $composer_flag_param = $req->get_param('composer');
+  if ($composer_flag_param === true || $composer_flag_param === '1' || $composer_flag_param === 1) {
+    $is_composer = true;
+  }
+
+  if (!$is_composer) {
+    foreach ($composer_markers as $marker) {
+      if (in_array($marker, array('composer', 'compose', 'luna_composer', 'luna_compose', 'lunacomposer', 'lunacompose'), true)) {
+        $is_composer = true;
+        break;
+      }
+    }
+  }
   $composer_enabled = get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1') === '1';
   if ($is_composer && !$composer_enabled) {
     return new WP_REST_Response(array(
@@ -5224,7 +5261,7 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
 
   }
 
-  if ($answer === '') {
+  if ($answer === '' && !$is_composer) {
     $facts_source = isset($facts['__source']) ? $facts['__source'] : ((isset($facts['comprehensive']) && $facts['comprehensive']) ? 'comprehensive' : 'basic');
     if ($facts_source !== 'comprehensive') {
       $canned = luna_widget_find_canned_response($prompt);
